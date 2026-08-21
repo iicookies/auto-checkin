@@ -2,7 +2,8 @@
 
 每天自动领取 **WorkBuddy（腾讯 CodeBuddy 国内版）** 和 **Trae（字节 Trae Work）** 的每日积分。
 
-- 零第三方依赖，纯 Python 标准库（`urllib` + `http.server`）
+- HTTP 签到（`checkin.py` / `login.py`）零第三方依赖，纯 Python 标准库
+- Trae HTTP claim 被 9074 拦住时，可用 `trae_ui_checkin.py` 点桌面端签到
 - OAuth 浏览器登录一次拿 token，之后自动刷新、自动签到
 - Windows 任务计划程序定时执行，token 不上云
 
@@ -12,21 +13,25 @@
 
 ```
 auto-checkin/
-├── checkin.py        # 主签到脚本：读凭证、刷新 token、调签到接口、查积分
-├── login.py          # 首次登录脚本：OAuth 浏览器登录，拿 token 存盘
-├── setup_task.ps1    # 注册 / 卸载 Windows 任务计划
-├── README.md         # 本文件
-├── auths/            # 登录后自动生成，存放各账号凭证（请勿外传）
+├── checkin.py           # 主签到脚本：读凭证、刷新 token、调签到接口、查积分
+├── login.py             # 首次登录脚本：OAuth 浏览器登录，拿 token 存盘
+├── trae_ui_checkin.py   # Trae 桌面端 UI 签到（点左下角用户信息 → 签到）
+├── requirements-ui.txt  # UI 签到额外依赖（HTTP 签到脚本不需要）
+├── setup_task.ps1       # 注册 / 卸载 Windows 任务计划
+├── README.md            # 本文件
+├── auths/               # 登录后自动生成，存放各账号凭证（请勿外传）
 │   ├── workbuddy-<uid>.json
 │   └── trae-<name>.json
-└── logs/             # 运行日志，自动生成
-    └── checkin.log
+└── logs/                # 运行日志，自动生成
+    ├── checkin.log
+    └── trae_ui_checkin.log
 ```
 
 ## 环境要求
 
-- Python 3.10+（`http.server` 回调、`urllib` 都在标准库里，无需 pip install）
-- Windows 系统（定时任务用 PowerShell 脚本注册；签到脚本本身跨平台）
+- Python 3.10+（`checkin.py` / `login.py` 只用标准库，无需 pip install）
+- Windows 系统（定时任务用 PowerShell 脚本注册；HTTP 签到脚本本身跨平台）
+- 若用 `trae_ui_checkin.py` 点桌面端签到，还需 `pywinauto`、`mss`、`pillow`、`rapidocr-onnxruntime`，且 Trae 窗口在前台
 
 ## 前置条件
 
@@ -100,9 +105,17 @@ python checkin.py
 
 带 `--debug` 可看完整 HTTP 请求/响应，排查问题用：
 
+````bash
+pyt
+
+HTTP claim 返回 9074 时，可改用桌面端点击（需 Trae 已登录并在前台）：
+
 ```bash
-python checkin.py --debug
-```
+python trae_ui_checkin.py
+python trae_ui_checkin.py --debug    # 保存截图并打印 OCR
+python trae_ui_checkin.py --dry-run  # 只定位，不点击
+```hon checkin.py --debug
+````
 
 ### 3. 注册 Windows 定时任务（每天自动执行）
 
@@ -136,7 +149,13 @@ cd C:\path\to\auto-checkin
 ## 常见问题
 
 **Q: Trae 提示"服务端限流，领取失败 (当前参与用户太多)"怎么办？**
-这是 Trae 服务端对签到接口的临时限流（返回码 9074），不是账号或脚本的问题。脚本已内置自动重试 3 次（间隔 20s/40s 递增），若仍失败会在日志里明确标注"服务端限流"。等限流解除（通常几小时到一天）下次定时执行时就会成功。2026-08-18/19 两个参考开源仓库均有用户反馈同样问题，属于平台侧策略，连 Trae 桌面客户端原版凭证都会被拦。
+这是 Trae 服务端对签到接口的临时限流（返回码 9074），不是账号或脚本的问题。`checkin.py` 已内置自动重试 3 次（间隔 20s/40s 递增）。HTTP claim 被拦时，可改用桌面端点击签到：
+
+```bash
+python trae_ui_checkin.py
+```
+
+需要本机已安装 `pywinauto`、`mss`、`pillow`、`rapidocr-onnxruntime`（当前 Python 环境已具备）。Trae 窗口必须在前台、桌面已解锁；脚本会先点左下角用户信息，再点账户菜单里的「签到」。Electron 内部按钮 UIA 不可见，所以走截图 + OCR，不是控件树点击。
 
 **Q: WorkBuddy 显示"今日已签到"是正常的吗？**
 正常。说明今天已经签到过了，脚本不再重复领取。
