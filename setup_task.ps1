@@ -78,10 +78,11 @@ if ($Install) {
     # 校验时间格式
     $t = Get-Date $Time -ErrorAction Stop
 
-    # 构造动作：python checkin.py >> logs\checkin.log
+    # 构造动作：python checkin.py
+    # 日志由 checkin.py 内部的 logging.FileHandler 写入 logs\checkin.log，不需要 shell 重定向
     $action = New-ScheduledTaskAction `
         -Execute $Python `
-        -Argument "`"$CheckinScript`" >> `"$LogFile`" 2>&1" `
+        -Argument "`"$CheckinScript`"" `
         -WorkingDirectory $ScriptDir
 
     # 每天定时触发

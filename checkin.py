@@ -35,7 +35,40 @@ CRED_DIR.mkdir(exist_ok=True)
 # 提前 24 小时判定 token 即将过期，触发刷新
 REFRESH_MARGIN = 24 * 3600
 
+LOG_DIR = BASE_DIR / "logs"
+LOG_DIR.mkdir(exist_ok=True)
+LOG_PATH = LOG_DIR / "checkin.log"
+
 DEBUG = False
+
+
+class _Tee:
+    """同时写 stdout 和日志文件，保证任务计划无控制台时也有记录。"""
+
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data: str) -> int:
+        for s in self.streams:
+            try:
+                s.write(data)
+                s.flush()
+            except Exception:
+                pass
+        return len(data)
+
+    def flush(self) -> None:
+        for s in self.streams:
+            try:
+                s.flush()
+            except Exception:
+                pass
+
+
+def setup_file_log() -> None:
+    log_fp = open(LOG_PATH, "a", encoding="utf-8")
+    sys.stdout = _Tee(sys.__stdout__, log_fp)
+    sys.stderr = _Tee(sys.__stderr__, log_fp)
 
 
 def dbg(msg: str) -> None:
@@ -252,6 +285,28 @@ class WorkBuddy:
 # ---------------------------------------------------------------------------
 # Trae (Trae Work 积分)
 # ---------------------------------------------------------------------------
+def resolve_trae_device_id(fallback: str = "") -> str:
+    """优先用 Trae 桌面客户端本地真实设备 ID。
+
+    baokun-l/trae-work-checkin 实测：claim 会校验设备标识，自造 deviceId
+    可能被拒，却返回误导性 9074「当前参与用户太多」。
+    """
+    candidates = [
+        Path.home() / "AppData" / "Roaming" / "TRAE SOLO CN" / "machineid",
+        Path.home() / "AppData" / "Roaming" / "Trae CN" / "machineid",
+        Path.home() / "AppData" / "Roaming" / "Trae" / "machineid",
+    ]
+    for p in candidates:
+        try:
+            if p.is_file():
+                v = p.read_text(encoding="utf-8").strip()
+                if v:
+                    return v
+        except OSError:
+            continue
+    return fallback
+
+
 class Trae:
     """字节 Trae IDE 每日 Work 积分领取。"""
 
@@ -264,7 +319,7 @@ class Trae:
         self.access_token = cred["accessToken"]
         self.refresh_token = cred["refreshToken"]
         self.expires_at = cred.get("expiresAt", 0)
-        self.device_id = cred["deviceId"]
+        self.device_id = resolve_trae_device_id(cred.get("deviceId", ""))
         self.screen_name = cred.get("screenName", "")
 
     # --- token 刷新 --------------------------------------------------------
@@ -338,6 +393,8 @@ class Trae:
             if not self.refresh():
                 result["status"] = "token 失效，请重新登录"
                 return result
+            persist(self.screen_name or self.user_id or "trae", "trae", self.to_cred())
+        elif self.device_id:
             persist(self.screen_name or self.user_id or "trae", "trae", self.to_cred())
 
         # 先查状态
@@ -474,6 +531,7 @@ def main() -> int:
     ap.add_argument("--debug", action="store_true", help="打印 HTTP 调试信息")
     args = ap.parse_args()
     DEBUG = args.debug
+    setup_file_log()
 
     print(f"=== 自动签到 {time.strftime('%Y-%m-%d %H:%M:%S')} ===")
     creds = load_creds()
