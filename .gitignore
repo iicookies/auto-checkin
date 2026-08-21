@@ -1,1 +1,5 @@
 __pycache__/
+logs/*.png
+logs/_*.txt
+logs/_*.js
+logs/_*.py

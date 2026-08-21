@@ -1,0 +1,6 @@
+# trae_ui_checkin.py 额外依赖（checkin.py / login.py 仍为零第三方依赖）
+pywinauto>=0.6.9
+mss>=9.0.0
+pillow>=10.0.0
+rapidocr-onnxruntime>=1.2.0
+numpy>=1.24.0
