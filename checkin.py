@@ -18,6 +18,7 @@
 import argparse
 import json
 import os
+import subprocess
 import sys
 import time
 import traceback
@@ -74,6 +75,73 @@ def setup_file_log() -> None:
 def dbg(msg: str) -> None:
     if DEBUG:
         print(f"    [debug] {msg}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Trae UI 签到兜底
+# ---------------------------------------------------------------------------
+UI_CHECKIN_SCRIPT = BASE_DIR / "trae_ui_checkin.py"
+
+# HTTP 签到失败、需要走 UI 兜底的状态关键词
+_UI_FALLBACK_KEYWORDS = (
+    "认证失败", "token 失效", "服务端限流", "领取请求失败",
+    "查询状态失败", "领取结果: code=",
+)
+
+
+def should_fallback_to_ui(status: str) -> bool:
+    """判断 Trae HTTP 签到状态是否需要 UI 兜底。"""
+    s = str(status)
+    return any(k in s for k in _UI_FALLBACK_KEYWORDS)
+
+
+def run_ui_checkin_fallback(timeout: int = 180) -> dict:
+    """调用 trae_ui_checkin.py 做 UI 签到兜底。
+
+    要求：Trae 桌面端已安装，且定时任务以交互式用户运行（本任务即如此）。
+    返回 {"ok": bool, "status": str}。
+    """
+    if not UI_CHECKIN_SCRIPT.is_file():
+        return {"ok": False, "status": "未找到 trae_ui_checkin.py，无法 UI 兜底"}
+
+    print("  [Trae] HTTP 签到未成功，启动 UI 签到兜底...")
+    try:
+        env = dict(os.environ)
+        # 强制子进程 UTF-8 输出，避免 GBK 控制台导致日志乱码
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
+        proc = subprocess.run(
+            [sys.executable, str(UI_CHECKIN_SCRIPT), "--timeout", str(timeout)],
+            cwd=str(BASE_DIR),
+            timeout=timeout + 60,          # 给脚本本身留缓冲
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        out = (proc.stdout or "") + (proc.stderr or "")
+        # 把 UI 脚本的输出透传到日志，方便排查
+        for line in out.splitlines():
+            if line.strip():
+                print(f"    [ui] {line}")
+        ok = proc.returncode == 0
+        # 从输出里提取状态行
+        status = "UI 兜底完成"
+        for line in out.splitlines():
+            ls = line.strip()
+            if ls.startswith("状态:") or ls.startswith("状态："):
+                status = f"UI 兜底 {ls.split(':', 1)[-1].split('：', 1)[-1].strip()}"
+                break
+        else:
+            if not ok:
+                status = f"UI 兜底失败（退出码 {proc.returncode}）"
+        return {"ok": ok, "status": status}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "status": "UI 兜底超时"}
+    except Exception as e:
+        return {"ok": False, "status": f"UI 兜底异常: {e}"}
 
 
 # ---------------------------------------------------------------------------
@@ -392,7 +460,7 @@ class Trae:
             print("  [Trae] token 即将过期，尝试刷新...")
             if not self.refresh():
                 result["status"] = "token 失效，请重新登录"
-                return result
+                return self._finalize(result)
             persist(self.screen_name or self.user_id or "trae", "trae", self.to_cred())
         elif self.device_id:
             persist(self.screen_name or self.user_id or "trae", "trae", self.to_cred())
@@ -404,11 +472,12 @@ class Trae:
             result["raw_status"] = st
         except RuntimeError as e:
             result["status"] = f"查询状态失败: {e}"
-            return result
+            return self._finalize(result)
 
         # 领取积分（服务端可能限流返回 9074，重试几次）
         claim_retries = 3
         r = None
+        auth_retried = False
         for attempt in range(1, claim_retries + 1):
             try:
                 r = self.do_claim()
@@ -419,10 +488,18 @@ class Trae:
                     print(f"  [Trae] 服务端限流(9074)，{wait}秒后重试({attempt}/{claim_retries})...")
                     time.sleep(wait)
                     continue
+                if code == 1001 and not auth_retried:
+                    # 认证失败：token 可能已失效，刷新后立即重试一次
+                    print("  [Trae] 服务端认证失败(1001)，尝试刷新 token 后重试...")
+                    auth_retried = True
+                    if self.refresh():
+                        persist(self.screen_name or self.user_id or "trae", "trae", self.to_cred())
+                        continue
+                    dbg("token 刷新失败，保留原结果")
                 break
             except RuntimeError as e:
                 result["status"] = f"领取请求失败: {e}"
-                return result
+                return self._finalize(result)
 
         result["raw_claim"] = r
         result["status"] = self._parse_claim_result(r)
@@ -436,6 +513,29 @@ class Trae:
         except RuntimeError as e:
             result["credits"] = f"查询积分失败: {e}"
 
+        # HTTP 签到未成功时，走桌面端 UI 签到兜底
+        return self._finalize(result)
+
+    def _finalize(self, result: dict) -> dict:
+        """收尾：HTTP 路径失败时统一走 UI 兜底。"""
+        if should_fallback_to_ui(result.get("status", "")):
+            ui_res = run_ui_checkin_fallback()
+            result["ui_fallback"] = ui_res
+            if ui_res.get("ok"):
+                result["status"] = ui_res["status"]
+                try:
+                    cr = self.query_credits()
+                    dbg(f"usage after ui: {cr}")
+                    parsed = self._parse_credits(cr)
+                    if str(parsed).startswith("当前积分"):
+                        result["credits"] = parsed
+                    else:
+                        # HTTP 查积分仍失败时，不要把错误 JSON 当积分展示
+                        result.pop("credits", None)
+                except Exception:
+                    result.pop("credits", None)
+            else:
+                result["status"] = f"{result['status']}；{ui_res['status']}"
         return result
 
     @staticmethod
@@ -451,7 +551,9 @@ class Trae:
             if kw in str(msg) or kw in str(r):
                 return f"今日已领取 ({msg})"
         if code == 1001:
-            return f"今日已领取 ({msg})"
+            # 1001 是服务端认证失败（"not able to authenticate"），
+            # 不能当作「今日已领取」，否则会掩盖真实失败、跳过兜底。
+            return f"认证失败，无法确认领取状态 ({msg})"
         return f"领取结果: code={code} msg={msg}"
 
     @staticmethod
@@ -558,7 +660,10 @@ def main() -> int:
         print(f"  状态: {res.get('status', '未知')}")
         if res.get("credits"):
             print(f"  积分: {res['credits']}")
-        if "token 失效" in str(res.get("status", "")):
+        st = str(res.get("status", ""))
+        # 明确的失败状态：token 失效、认证失败且兜底也没救回来、限流未领到
+        if any(k in st for k in ("token 失效", "认证失败", "UI 兜底失败",
+                                 "服务端限流，领取失败", "兜底超时", "兜底异常")):
             overall_ok = False
 
     print("\n=== 完成 ===")

@@ -227,12 +227,28 @@ def find_window():
             pid = w.element_info.process_id
         except Exception:
             continue
+        # 跳过安装器/更新器窗口（如「安装 - TraeWork CN (User)」、Squirrel Setup），
+        # 否则会在安装界面上误点击。
+        if is_installer_title(title):
+            continue
         if any(t.lower() in title.lower() for t in WINDOW_TITLES):
+            exe = _process_exe(pid)
+            if exe and not _is_trae_cn_exe(exe):
+                continue  # 标题像 Trae 但进程不是 Trae 本体（多为安装器）
             return w
         exe = _process_exe(pid)
         if _is_trae_cn_exe(exe) and "Chrome_WidgetWin" in cls:
             fallback = w
     return fallback
+
+
+def is_installer_title(title: str) -> bool:
+    t = (title or "").lower()
+    markers = ("setup", "installer", "installing", "install - ", " - install")
+    if any(m in t for m in markers):
+        return True
+    stripped = (title or "").strip()
+    return stripped.startswith(("安装", "正在安装", "卸载"))
 
 
 def launch_trae() -> None:
