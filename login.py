@@ -57,7 +57,11 @@ class CallbackHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         query = urllib.parse.parse_qs(parsed.query)
-        self.server.auth_result = dict(query)  # type: ignore[attr-defined]
+        # parse_qs 的值是列表，取首个标量，否则会把 ["xxx"] 原样发给服务端换 token
+        self.server.auth_result = {  # type: ignore[attr-defined]
+            k: (v[0] if v else "") for k, v in query.items()
+        }
+
 
         dbg(f"收到回调: {self.path}")
 
@@ -324,8 +328,13 @@ def login_trae() -> int:
 
     # 计算 expiresAt（TokenExpireAt / refreshExpireAt 通常是毫秒时间戳）
     expires_at = time.time() + 3600  # 默认 1 小时
+    try:
+        expire_at = float(expire_at) if expire_at else None
+    except (TypeError, ValueError):
+        expire_at = None
     if expire_at:
         expires_at = expire_at / 1000 if expire_at > 1e12 else expire_at
+
 
     name = screen_name or user_id or "trae"
     cred = {
@@ -354,7 +363,14 @@ def login_trae() -> int:
 # ---------------------------------------------------------------------------
 def main() -> int:
     global DEBUG
+    # GBK 控制台下 emoji 会抛 UnicodeEncodeError，直接把输出流改成 UTF-8
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
     ap = argparse.ArgumentParser(description="首次 OAuth 登录，获取签到凭证")
+
     ap.add_argument("product", choices=["workbuddy", "trae"], help="要登录的产品")
     ap.add_argument("--debug", action="store_true", help="打印调试信息")
     args = ap.parse_args()
