@@ -95,10 +95,11 @@ def should_fallback_to_ui(status: str) -> bool:
     return any(k in s for k in _UI_FALLBACK_KEYWORDS)
 
 
-def run_ui_checkin_fallback(timeout: int = 180) -> dict:
+def run_ui_checkin_fallback(timeout: int = 420, ready_timeout: int = 120) -> dict:
     """调用 trae_ui_checkin.py 做 UI 签到兜底。
 
     要求：Trae 桌面端已安装，且定时任务以交互式用户运行（本任务即如此）。
+    冷启动 + 自动更新安装实测要几分钟，所以等待窗口给到 timeout 秒。
     返回 {"ok": bool, "status": str}。
     """
     if not UI_CHECKIN_SCRIPT.is_file():
@@ -111,9 +112,15 @@ def run_ui_checkin_fallback(timeout: int = 180) -> dict:
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONUTF8"] = "1"
         proc = subprocess.run(
-            [sys.executable, str(UI_CHECKIN_SCRIPT), "--timeout", str(timeout)],
+            [
+                sys.executable, str(UI_CHECKIN_SCRIPT),
+                "--timeout", str(timeout),
+                "--ready-timeout", str(ready_timeout),
+            ],
             cwd=str(BASE_DIR),
-            timeout=timeout + 60,          # 给脚本本身留缓冲
+            # 窗口等待 + 界面就绪等待 + OCR，再留 120s 缓冲
+            timeout=timeout + ready_timeout + 120,
+
             capture_output=True,
             text=True,
             encoding="utf-8",

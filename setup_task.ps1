@@ -1,4 +1,4 @@
-﻿# 注册 / 卸载 Windows 任务计划，每天定时执行签到。
+# 注册 / 卸载 Windows 任务计划，每天定时执行签到。
 #
 # 用法（以管理员身份运行 PowerShell）:
 #   .\setup_task.ps1 -Install          # 注册每天 09:05 执行的任务
@@ -89,11 +89,13 @@ if ($Install) {
     $trigger = New-ScheduledTaskTrigger -Daily -At $t
 
     # 允许在电池供电时也运行，失败后重试
+    # 时限 20 分钟：Trae UI 兜底冷启动 + 自动更新安装最坏情况约 11 分钟
     $settings = New-ScheduledTaskSettingsSet `
         -StartWhenAvailable `
         -DontStopIfGoingOnBatteries `
         -AllowStartIfOnBatteries `
-        -ExecutionTimeLimit (New-TimeSpan -Minutes 10) `
+        -ExecutionTimeLimit (New-TimeSpan -Minutes 20) `
+
         -RestartCount 2 `
         -RestartInterval (New-TimeSpan -Minutes 15)
 

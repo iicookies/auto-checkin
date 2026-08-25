@@ -3,3 +3,5 @@ logs/*.png
 logs/_*.txt
 logs/_*.js
 logs/_*.py
+logs/checkin.log
+logs/trae_ui_checkin.log

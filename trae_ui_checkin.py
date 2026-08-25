@@ -271,8 +271,33 @@ def launch_trae() -> None:
     )
 
 
-def wait_window(timeout: float):
+def has_installer_window() -> bool:
+    """桌面上是否存在 Trae 安装/更新窗口。"""
+    from pywinauto import Desktop
+
+    try:
+        windows = Desktop(backend="uia").windows()
+    except Exception:
+        return False
+    for w in windows:
+        try:
+            title = w.window_text() or ""
+        except Exception:
+            continue
+        if is_installer_title(title):
+            return True
+    return False
+
+
+def wait_window(timeout: float, installer_grace: float = 420.0):
+    """等待 Trae 主窗口。
+
+    启动可能先触发自动更新的安装器（实测装 4 分钟以上），期间主窗口不存在。
+    只要安装器还在，就把截止时间往后顶，最多额外等 installer_grace 秒。
+    """
     deadline = time.time() + timeout
+    hard_deadline = deadline + installer_grace
+    notified = False
     while time.time() < deadline:
         win = find_window()
         if win is not None:
@@ -281,6 +306,11 @@ def wait_window(timeout: float):
                     return win
             except Exception:
                 pass
+        if has_installer_window():
+            if not notified:
+                print("  检测到 Trae 安装/更新窗口，等待安装完成后再找主窗口...")
+                notified = True
+            deadline = min(hard_deadline, time.time() + 60.0)
         time.sleep(1.0)
     return None
 
@@ -344,7 +374,7 @@ def click_hit(hit: Hit, shot_left: int, shot_top: int, dx: int = 0, dy: int = 0)
 # ---------------------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------------------
-def run(debug: bool, dry_run: bool, launch: bool, timeout: int) -> int:
+def run(debug: bool, dry_run: bool, launch: bool, timeout: int, ready_timeout: int) -> int:
     print(f"=== Trae UI 签到 {time.strftime('%Y-%m-%d %H:%M:%S')} ===")
 
     win = find_window()
@@ -358,7 +388,12 @@ def run(debug: bool, dry_run: bool, launch: bool, timeout: int) -> int:
         if win is None:
             print("启动后仍未出现 TraeWork CN 窗口。")
             return 1
+        try:
+            print(f"  窗口: {win.window_text()!r}")
+        except Exception:
+            pass
         time.sleep(2.0)
+
     else:
         try:
             print(f"  窗口: {win.window_text()!r}")
@@ -369,15 +404,35 @@ def run(debug: bool, dry_run: bool, launch: bool, timeout: int) -> int:
     ocr = OcrEngine()
 
     def snap(tag: str):
-        path = LOG_DIR / f"trae_ui_{tag}.png" if debug or dry_run else None
+        # 截图始终留档，定时任务失败时才有排查依据；逐条 OCR 文本仍只在 --debug 打印
+        path = LOG_DIR / f"trae_ui_{tag}.png"
         img, arr, left, top = grab_window(win, path)
         hits = ocr.run(arr)
-        if debug or dry_run:
-            print(f"  [{tag}] OCR {len(hits)} 条" + (f" -> {path.name}" if path else ""))
-            if debug:
-                for h in hits:
-                    print(f"    {h.x1:4d},{h.y1:4d} {h.score:.2f} {h.text}")
+        print(f"  [{tag}] OCR {len(hits)} 条 -> {path.name}")
+        if debug:
+            for h in hits:
+                print(f"    {h.x1:4d},{h.y1:4d} {h.score:.2f} {h.text}")
         return img, hits, left, top
+
+    def ui_ready(img, hits) -> bool:
+        return (
+            find_user_chip(hits, img.height) is not None
+            or find_checkin_button(hits) is not None
+            or already_checked_in(hits)
+        )
+
+    def wait_ui_ready(timeout: float):
+        """冷启动时窗口先出现、界面后渲染，等到能认出用户信息/签到入口再动手。"""
+        deadline = time.time() + timeout
+        while True:
+            img, hits, left, top = snap("before")
+            if ui_ready(img, hits):
+                return img, hits, left, top, True
+            if time.time() >= deadline:
+                return img, hits, left, top, False
+            print("  界面尚未就绪，等待渲染...")
+            time.sleep(4.0)
+            focus_window(win)
 
     def click_user(img, hits, left, top) -> None:
         user = find_user_chip(hits, img.height)
@@ -391,8 +446,13 @@ def run(debug: bool, dry_run: bool, launch: bool, timeout: int) -> int:
         if debug:
             print(f"    box=({user.x1},{user.y1})-({user.x2},{user.y2})")
 
-    img, hits, left, top = snap("before")
+    img, hits, left, top, ready = wait_ui_ready(ready_timeout)
+    if not ready:
+        print(f"  窗口已出现但界面 {ready_timeout:.0f}s 内未就绪（未识别到用户信息/签到入口）。")
+        print(f"  可查看 {LOG_DIR / 'trae_ui_before.png'}")
+        return 2
     menu_open = find_checkin_button(hits) is not None or already_checked_in(hits)
+
     if dry_run:
         user = find_user_chip(hits, img.height)
         if user is None:
@@ -482,7 +542,9 @@ def main() -> int:
     ap.add_argument("--debug", action="store_true", help="保存截图并打印 OCR 文本")
     ap.add_argument("--dry-run", action="store_true", help="只定位用户信息，不点菜单/签到")
     ap.add_argument("--no-launch", action="store_true", help="找不到窗口时不自动启动 Trae")
-    ap.add_argument("--timeout", type=int, default=90, help="等待 Trae 窗口出现的秒数")
+    ap.add_argument("--timeout", type=int, default=300, help="等待 Trae 窗口出现的秒数")
+    ap.add_argument("--ready-timeout", type=int, default=120,
+                    help="窗口出现后等界面渲染出用户信息的秒数")
     args = ap.parse_args()
     setup_file_log()
     try:
@@ -491,7 +553,9 @@ def main() -> int:
             dry_run=args.dry_run,
             launch=not args.no_launch,
             timeout=args.timeout,
+            ready_timeout=args.ready_timeout,
         )
+
     except KeyboardInterrupt:
         print("\n已中断")
         return 130
