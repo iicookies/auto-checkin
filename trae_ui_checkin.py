@@ -119,13 +119,19 @@ def find_user_chip(hits: list[Hit], img_h: int) -> Hit | None:
     return max(cands, key=lambda h: h.y1)
 
 
-def find_checkin_button(hits: list[Hit]) -> Hit | None:
-    """账户菜单里的「签到」按钮，不要点到左侧「每日签到领200积分」说明文字。"""
-    exact = [h for h in hits if h.compact == "签到"]
+def find_checkin_button(hits: list[Hit], img_h: int) -> Hit | None:
+    """账户菜单里的「签到」按钮。
+
+    要排除两类干扰：左侧说明文字「每日签到领200积分」，以及左下角那个
+    「每日签到领积分」浮层里的签到按钮（点它不会有可识别的结果反馈）。
+    """
+    floor = int(img_h * 0.85)  # 左下角浮层区域，不要点
+    cands = [h for h in hits if h.y2 < floor]
+    exact = [h for h in cands if h.compact == "签到"]
     if exact:
         return max(exact, key=lambda h: h.x1)
     loose = [
-        h for h in hits
+        h for h in cands
         if h.compact.endswith("签到")
         and "每日" not in h.compact
         and "今日" not in h.compact
@@ -134,6 +140,13 @@ def find_checkin_button(hits: list[Hit]) -> Hit | None:
     if loose:
         return max(loose, key=lambda h: h.x1)
     return None
+
+
+def account_menu_open(hits: list[Hit]) -> bool:
+    """账户菜单是否展开：靠「管理账户 / 退出登录」这类菜单专属项判断。"""
+    blob = "".join(h.compact for h in hits)
+    return any(k in blob for k in ("管理账户", "退出登录", "报告问题"))
+
 
 
 def already_checked_in(hits: list[Hit]) -> bool:
@@ -215,18 +228,49 @@ def _is_trae_cn_exe(exe: str) -> bool:
     return "trae solo cn" in parent or "traework" in name
 
 
-def find_window():
-    from pywinauto import Desktop
+def _visible_top_windows() -> list[tuple[int, str, str, int]]:
+    """Win32 枚举可见顶层窗口 -> [(hwnd, title, class_name, pid)]。
 
-    desk = Desktop(backend="uia")
-    fallback = None
-    for w in desk.windows():
+    这里刻意不用 pywinauto 的 uia 枚举：实测定时任务里「先启动 Trae 再轮询」的
+    进程，uia 枚举始终看不到新出现的 Trae 窗口（同一时刻另起一个进程能立刻找到），
+    等待必然超时。Win32 EnumWindows 没有这个问题，而且快得多。
+    """
+    import win32gui
+    import win32process
+
+    found: list[tuple[int, str, str, int]] = []
+
+    def _collect(hwnd, _):
         try:
-            title = w.window_text() or ""
-            cls = w.element_info.class_name or ""
-            pid = w.element_info.process_id
+            if not win32gui.IsWindowVisible(hwnd):
+                return True
+            title = win32gui.GetWindowText(hwnd) or ""
+            cls = win32gui.GetClassName(hwnd) or ""
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            found.append((hwnd, title, cls, pid))
         except Exception:
-            continue
+            pass
+        return True
+
+    win32gui.EnumWindows(_collect, None)
+    return found
+
+
+def _window_size(hwnd: int) -> tuple[int, int]:
+    import win32gui
+
+    try:
+        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+    except Exception:
+        return 0, 0
+    return right - left, bottom - top
+
+
+def find_window():
+    from pywinauto.controls.hwndwrapper import HwndWrapper
+
+    fallback = None
+    for hwnd, title, cls, pid in _visible_top_windows():
         # 跳过安装器/更新器窗口（如「安装 - TraeWork CN (User)」、Squirrel Setup），
         # 否则会在安装界面上误点击。
         if is_installer_title(title):
@@ -235,11 +279,23 @@ def find_window():
             exe = _process_exe(pid)
             if exe and not _is_trae_cn_exe(exe):
                 continue  # 标题像 Trae 但进程不是 Trae 本体（多为安装器）
-            return w
-        exe = _process_exe(pid)
-        if _is_trae_cn_exe(exe) and "Chrome_WidgetWin" in cls:
-            fallback = w
+            return HwndWrapper(hwnd)
+        # 启动早期主窗口可能还没标题，用进程 + 窗口类兜底（排除 Electron 的辅助小窗）
+        if fallback is None and "Chrome_WidgetWin" in cls and _is_trae_cn_exe(_process_exe(pid)):
+            w, h = _window_size(hwnd)
+            if w >= 600 and h >= 400:
+                fallback = HwndWrapper(hwnd)
     return fallback
+
+
+def window_alive(win) -> bool:
+    import win32gui
+
+    try:
+        return bool(win32gui.IsWindow(win.handle) and win32gui.IsWindowVisible(win.handle))
+    except Exception:
+        return False
+
 
 
 def is_installer_title(title: str) -> bool:
@@ -273,20 +329,7 @@ def launch_trae() -> None:
 
 def has_installer_window() -> bool:
     """桌面上是否存在 Trae 安装/更新窗口。"""
-    from pywinauto import Desktop
-
-    try:
-        windows = Desktop(backend="uia").windows()
-    except Exception:
-        return False
-    for w in windows:
-        try:
-            title = w.window_text() or ""
-        except Exception:
-            continue
-        if is_installer_title(title):
-            return True
-    return False
+    return any(is_installer_title(title) for _, title, _, _ in _visible_top_windows())
 
 
 def wait_window(timeout: float, installer_grace: float = 420.0):
@@ -295,24 +338,27 @@ def wait_window(timeout: float, installer_grace: float = 420.0):
     启动可能先触发自动更新的安装器（实测装 4 分钟以上），期间主窗口不存在。
     只要安装器还在，就把截止时间往后顶，最多额外等 installer_grace 秒。
     """
-    deadline = time.time() + timeout
+    start = time.time()
+    deadline = start + timeout
     hard_deadline = deadline + installer_grace
     notified = False
+    next_tick = start + 30.0
     while time.time() < deadline:
         win = find_window()
-        if win is not None:
-            try:
-                if win.exists():
-                    return win
-            except Exception:
-                pass
+        if win is not None and window_alive(win):
+            return win
         if has_installer_window():
             if not notified:
                 print("  检测到 Trae 安装/更新窗口，等待安装完成后再找主窗口...")
                 notified = True
             deadline = min(hard_deadline, time.time() + 60.0)
+        now = time.time()
+        if now >= next_tick:
+            print(f"  等待中... 已 {int(now - start)}s，当前可见顶层窗口 {len(_visible_top_windows())} 个")
+            next_tick = now + 30.0
         time.sleep(1.0)
     return None
+
 
 
 def focus_window(win) -> None:
@@ -417,9 +463,10 @@ def run(debug: bool, dry_run: bool, launch: bool, timeout: int, ready_timeout: i
     def ui_ready(img, hits) -> bool:
         return (
             find_user_chip(hits, img.height) is not None
-            or find_checkin_button(hits) is not None
+            or find_checkin_button(hits, img.height) is not None
             or already_checked_in(hits)
         )
+
 
     def wait_ui_ready(timeout: float):
         """冷启动时窗口先出现、界面后渲染，等到能认出用户信息/签到入口再动手。"""
@@ -451,7 +498,7 @@ def run(debug: bool, dry_run: bool, launch: bool, timeout: int, ready_timeout: i
         print(f"  窗口已出现但界面 {ready_timeout:.0f}s 内未就绪（未识别到用户信息/签到入口）。")
         print(f"  可查看 {LOG_DIR / 'trae_ui_before.png'}")
         return 2
-    menu_open = find_checkin_button(hits) is not None or already_checked_in(hits)
+    menu_open = account_menu_open(hits) or already_checked_in(hits)
 
     if dry_run:
         user = find_user_chip(hits, img.height)
@@ -459,7 +506,7 @@ def run(debug: bool, dry_run: bool, launch: bool, timeout: int, ready_timeout: i
             print("  [dry-run] 未识别到用户信息")
         else:
             print(f"  [dry-run] 用户信息: {user.text!r} @ ({user.cx},{user.cy})")
-        btn = find_checkin_button(hits)
+        btn = find_checkin_button(hits, img.height)
         if btn is not None:
             print(f"  [dry-run] 签到按钮: {btn.text!r} @ ({btn.cx},{btn.cy})")
         if already_checked_in(hits):
@@ -475,12 +522,13 @@ def run(debug: bool, dry_run: bool, launch: bool, timeout: int, ready_timeout: i
             time.sleep(1.2)
             focus_window(win)
             img, hits, left, top = snap("menu" if attempt == 1 else f"menu{attempt}")
-            if find_checkin_button(hits) is not None or already_checked_in(hits):
+            if account_menu_open(hits) or already_checked_in(hits):
                 break
             print(f"  账户菜单未展开，重试点击用户信息 ({attempt}/3)")
         else:
             print("多次点击后仍未展开账户菜单。请确认 Trae 窗口在前台且未被遮挡。")
             return 2
+
 
     credits_before = parse_menu_credits(hits)
     if credits_before is not None:
@@ -493,8 +541,9 @@ def run(debug: bool, dry_run: bool, launch: bool, timeout: int, ready_timeout: i
         print("=== 完成 ===")
         return 0
 
-    btn = find_checkin_button(hits)
+    btn = find_checkin_button(hits, img.height)
     if btn is None:
+
         print("已打开用户菜单，但 OCR 未找到「签到」按钮。")
         print("请确认 Trae 窗口未被遮挡，账户菜单已展开。")
         return 2
