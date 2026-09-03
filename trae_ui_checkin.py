@@ -119,11 +119,22 @@ def find_user_chip(hits: list[Hit], img_h: int) -> Hit | None:
     return max(cands, key=lambda h: h.y1)
 
 
+def _is_daily_checkin_label(compact: str) -> bool:
+    """左侧说明文案：每日签到领…积分（OCR 可能带前缀噪声，如「白」）。"""
+    c = compact
+    return ("每日" in c and "签到" in c and "积分" in c) or (
+        "签到领" in c and "积分" in c
+    )
+
+
 def find_checkin_button(hits: list[Hit], img_h: int) -> Hit | None:
     """账户菜单里的「签到」按钮。
 
     要排除两类干扰：左侧说明文字「每日签到领200积分」，以及左下角那个
     「每日签到领积分」浮层里的签到按钮（点它不会有可识别的结果反馈）。
+
+    实测 RapidOCR 偶发只认出左侧说明、漏掉右侧独立「签到」按钮（像素仍在，
+    约在说明文字右侧 60~110px）。此时用说明行推算按钮位置做兜底。
     """
     floor = int(img_h * 0.85)  # 左下角浮层区域，不要点
     cands = [h for h in hits if h.y2 < floor]
@@ -139,6 +150,21 @@ def find_checkin_button(hits: list[Hit], img_h: int) -> Hit | None:
     ]
     if loose:
         return max(loose, key=lambda h: h.x1)
+
+    # OCR 漏检独立「签到」：从「每日签到领…积分」说明行推算右侧按钮
+    labels = [h for h in cands if _is_daily_checkin_label(h.compact)]
+    if labels:
+        label = max(labels, key=lambda h: h.y1)
+        # 实测说明文字右缘(x=216)到按钮左缘(x=285)间距约 69px，按钮宽约 37px
+        btn_w, gap = 40, 65
+        x1 = label.x2 + gap
+        x2 = x1 + btn_w
+        y1, y2 = label.y1, label.y2
+        print(
+            f"  OCR 未单独识别「签到」，按说明文案 {label.text!r} "
+            f"推算按钮 @ ({(x1 + x2) // 2},{(y1 + y2) // 2})"
+        )
+        return Hit(text="签到", score=0.5, x1=x1, y1=y1, x2=x2, y2=y2)
     return None
 
 
