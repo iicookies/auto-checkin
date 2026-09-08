@@ -3,9 +3,9 @@
 每天自动领取 **WorkBuddy（腾讯 CodeBuddy 国内版）** 和 **Trae（字节 Trae Work）** 的每日积分。
 
 - HTTP 签到（`checkin.py` / `login.py`）零第三方依赖，纯 Python 标准库
-- Trae HTTP claim 被 9074 拦住时，可用 `trae_ui_checkin.py` 点桌面端签到
 - OAuth 浏览器登录一次拿 token，之后自动刷新、自动签到
 - Windows 任务计划程序定时执行，token 不上云
+- `trae_ui_checkin.py` 是独立的手动 UI 签到工具；`checkin.py` 默认不调用，加 `--ui-fallback` 才在 HTTP 失败时兜底
 
 > ⚠️ 这是第三方逆向脚本，与官方无关，可能违反服务条款，接口随时可能失效。请自行评估风险后使用。
 
@@ -105,17 +105,23 @@ python checkin.py
 
 带 `--debug` 可看完整 HTTP 请求/响应，排查问题用：
 
-````bash
-pyt
+```bash
+python checkin.py --debug
+```
 
-HTTP claim 返回 9074 时，可改用桌面端点击（需 Trae 已登录并在前台）：
+Trae HTTP 签到失败时，可用 `--ui-fallback` 让脚本自动调桌面端 UI 签到兜底（默认关闭）：
+
+```bash
+python checkin.py --ui-fallback
+```
+
+也可直接手动运行桌面端点击签到（需 Trae 已登录并在前台）：
 
 ```bash
 python trae_ui_checkin.py
 python trae_ui_checkin.py --debug    # 保存截图并打印 OCR
 python trae_ui_checkin.py --dry-run  # 只定位，不点击
-```hon checkin.py --debug
-````
+```
 
 ### 3. 注册 Windows 定时任务（每天自动执行）
 

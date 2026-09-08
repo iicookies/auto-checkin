@@ -16,8 +16,10 @@
 """
 
 import argparse
+import base64
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -78,9 +80,14 @@ def dbg(msg: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Trae UI 签到兜底
+# Trae UI 签到兜底（默认关闭）。
+# 9074 根因已确认为设备号问题，修复后 HTTP 签到即可成功，无需 UI 兜底。
+# 需要时用命令行开关启用：python checkin.py --ui-fallback
 # ---------------------------------------------------------------------------
+TRAE_UI_FALLBACK_ENABLED = False
+
 UI_CHECKIN_SCRIPT = BASE_DIR / "trae_ui_checkin.py"
+LOGIN_SCRIPT = BASE_DIR / "login.py"
 
 # HTTP 签到失败、需要走 UI 兜底的状态关键词
 _UI_FALLBACK_KEYWORDS = (
@@ -149,6 +156,47 @@ def run_ui_checkin_fallback(timeout: int = 420, ready_timeout: int = 120) -> dic
         return {"ok": False, "status": "UI 兜底超时"}
     except Exception as e:
         return {"ok": False, "status": f"UI 兜底异常: {e}"}
+
+
+def run_trae_relogin(timeout: int = 360) -> bool:
+    """token 失效时调用 login.py trae，打开浏览器让用户重新登录。
+
+    交互式终端：输出跟当前窗口；计划任务无控制台时另开窗口。
+    成功返回 True（凭证已由 login.py 写盘）。
+    """
+    if not LOGIN_SCRIPT.is_file():
+        print("  [Trae] 未找到 login.py，无法自动重新登录")
+        return False
+
+    print("  [Trae] token 失效，启动 python login.py trae ...")
+    print("  [Trae] 请在浏览器完成登录（最多 5 分钟）")
+    try:
+        env = dict(os.environ)
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
+        cmd = [sys.executable, str(LOGIN_SCRIPT), "trae"]
+        if DEBUG:
+            cmd.append("--debug")
+        kwargs = {
+            "cwd": str(BASE_DIR),
+            "timeout": timeout,
+            "env": env,
+        }
+        # 无 TTY（计划任务）时弹出新控制台，否则用户看不到登录提示
+        if not getattr(sys.__stdout__, "isatty", lambda: False)():
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+        proc = subprocess.run(cmd, **kwargs)
+        if proc.returncode == 0:
+            print("  [Trae] 重新登录成功")
+            return True
+        print(f"  [Trae] 重新登录失败（退出码 {proc.returncode}）")
+        return False
+    except subprocess.TimeoutExpired:
+        print("  [Trae] 重新登录超时")
+        return False
+    except Exception as e:
+        print(f"  [Trae] 重新登录异常: {e}")
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -361,25 +409,71 @@ class WorkBuddy:
 # Trae (Trae Work 积分)
 # ---------------------------------------------------------------------------
 def resolve_trae_device_id(fallback: str = "") -> str:
-    """优先用 Trae 桌面客户端本地真实设备 ID。
+    """优先用 Trae 桌面客户端本地真实设备 ID（16 位 Aha 数字号）。
 
-    baokun-l/trae-work-checkin 实测：claim 会校验设备标识，自造 deviceId
-    可能被拒，却返回误导性 9074「当前参与用户太多」。
+    baokun-l/trae-work-checkin 实测：claim 会校验设备标识，x-device-id 必须是
+    storage.json 中 `iCubeAuthInfo://icube-dc:{16位数字}` 的 Aha 数字号；
+    用 UUID / GUID / hex 设备号会被风控判定为非客户端设备，返回误导性 9074
+    「当前参与用户太多」。（storage.json 中 has_device_id_updated_to_aha=true
+    印证客户端已把 UUID 升级为 Aha 数字号。）
     """
-    candidates = [
+    # 各客户端 storage.json: %APPDATA%\<客户端>\User\globalStorage\storage.json
+    storage_candidates = [
+        Path.home() / "AppData" / "Roaming" / "TRAE SOLO CN",
+        Path.home() / "AppData" / "Roaming" / "Trae CN",
+        Path.home() / "AppData" / "Roaming" / "Trae",
+    ]
+    # iCubeAuthInfo://icube-dc: 后跟 16 位十进制数字
+    aha_key_re = re.compile(r"iCubeAuthInfo://icube-dc:(\d{16})(?!\d)")
+    for base in storage_candidates:
+        storage = base / "User" / "globalStorage" / "storage.json"
+        try:
+            if not storage.is_file():
+                continue
+            text = storage.read_text(encoding="utf-8", errors="replace")
+            m = aha_key_re.search(text)
+            if m:
+                v = m.group(1)
+                dbg(f"Trae Aha 设备号来自 {storage}")
+                return v
+        except OSError:
+            continue
+
+    # 兜底：旧版 machineid（UUID，可能触发 9074）
+    mid_candidates = [
         Path.home() / "AppData" / "Roaming" / "TRAE SOLO CN" / "machineid",
         Path.home() / "AppData" / "Roaming" / "Trae CN" / "machineid",
         Path.home() / "AppData" / "Roaming" / "Trae" / "machineid",
     ]
-    for p in candidates:
+    for p in mid_candidates:
         try:
             if p.is_file():
                 v = p.read_text(encoding="utf-8").strip()
                 if v:
+                    dbg(f"Trae 设备号回退 machineid（UUID，可能触发 9074）: {p}")
                     return v
         except OSError:
             continue
     return fallback
+
+
+def _user_id_from_jwt(token: str) -> str:
+    """从 Cloud-IDE-JWT payload.data.id 提取用户 ID。凭证里 userId 常为空。"""
+    if not token or "." not in token:
+        return ""
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        obj = json.loads(base64.urlsafe_b64decode(payload))
+        data = obj.get("data") if isinstance(obj, dict) else None
+        uid = ""
+        if isinstance(data, dict):
+            uid = data.get("id") or data.get("UserID") or ""
+        if not uid and isinstance(obj, dict):
+            uid = obj.get("UserID") or obj.get("userId") or ""
+        return str(uid) if uid else ""
+    except Exception:
+        return ""
 
 
 class Trae:
@@ -396,12 +490,19 @@ class Trae:
         self.expires_at = cred.get("expiresAt", 0)
         self.device_id = resolve_trae_device_id(cred.get("deviceId", ""))
         self.screen_name = cred.get("screenName", "")
+        # 文件名用加载时的名字，避免后来补上 userId 后写出第二份凭证
+        self._cred_name = self.screen_name or self.user_id or "trae"
+        if not self.user_id:
+            self.user_id = _user_id_from_jwt(self.access_token)
+        self.refresh_rejected = False
 
     # --- token 刷新 --------------------------------------------------------
     def needs_refresh(self) -> bool:
         return self.expires_at - time.time() < REFRESH_MARGIN
 
     def refresh(self) -> bool:
+        """刷新 token。失败时置 self.refresh_rejected=True 表示被服务端明确拒绝。"""
+        self.refresh_rejected = False
         headers = {"Content-Type": "application/json"}
         body = {
             "ClientID": "en1oxy7wnw8j9n",
@@ -423,6 +524,11 @@ class Trae:
 
         if not new_access:
             dbg(f"Trae 刷新返回无 token: {data}")
+            # 响应里带 Error.Code（如 20101 refresh token is invalid）说明被明确拒绝，
+            # 与网络异常区分开：前者需重新登录，后者只需下次再试
+            err = ((data.get("ResponseMetadata") or {}).get("Error") or {}).get("Code")
+            if err:
+                self.refresh_rejected = True
             return False
 
         self.access_token = new_access
@@ -438,11 +544,12 @@ class Trae:
 
     # --- 业务接口 ----------------------------------------------------------
     def _auth_headers(self) -> dict:
+        # 对齐参照项目最小头集：Authorization + x-device-id + X-User-Region。
+        # 不另加 X-Device-Id 重复头。User-Agent 用官方客户端值，避免 urllib 默认 UA。
         return {
             "Content-Type": "application/json",
-            "Authorization": f"Cloud-IDE-JWT {self.access_token}",   # 注意前缀
+            "Authorization": f"Cloud-IDE-JWT {self.access_token}",
             "x-device-id": self.device_id,
-            "X-Device-Id": self.device_id,
             "X-User-Region": "CN",
             "User-Agent": self.UA,
         }
@@ -459,20 +566,59 @@ class Trae:
         return http_request("POST", f"{self.BASE}/trae/api/v2/pay/ide_user_ent_usage",
                             self._auth_headers(), body={})
 
+    def _persist(self) -> None:
+        persist(self._cred_name, "trae", self.to_cred())
+
+    def _query_credits_safe(self, result: dict) -> None:
+        try:
+            cr = self.query_credits()
+            dbg(f"usage: {cr}")
+            result["raw_credits"] = cr
+            parsed = self._parse_credits(cr)
+            # 认证失败/错误响应时不把错误 JSON 当积分展示
+            if str(parsed).startswith("当前积分"):
+                result["credits"] = parsed
+        except RuntimeError as e:
+            result["credits"] = f"查询积分失败: {e}"
+
+    def _handle_auth_failure(self, result: dict, where: str) -> str | None:
+        """1001 时刷新一次。返回 None 表示刷新成功可重试；返回 status 表示应结束。"""
+        if self.refresh_rejected:
+            return "token 失效，请重新登录 (login.py trae)"
+        print(f"  [Trae] {where}认证失败(1001)，尝试刷新 token 后重试...")
+        if self.refresh():
+            if not self.user_id:
+                self.user_id = _user_id_from_jwt(self.access_token)
+            self._persist()
+            return None
+        if self.refresh_rejected:
+            return "token 失效，请重新登录 (login.py trae)"
+        return f"认证失败，无法确认领取状态（{where}刷新未成功）"
+
     # --- 主流程 ------------------------------------------------------------
     def run(self) -> dict:
         result = {"product": "Trae", "userId": self.user_id, "screenName": self.screen_name}
 
         if self.needs_refresh():
             print("  [Trae] token 即将过期，尝试刷新...")
-            if not self.refresh():
-                result["status"] = "token 失效，请重新登录"
+            if self.refresh():
+                if not self.user_id:
+                    self.user_id = _user_id_from_jwt(self.access_token)
+                self._persist()
+            elif self.refresh_rejected and self.expires_at <= time.time():
+                result["status"] = "token 失效，请重新登录 (login.py trae)"
                 return self._finalize(result)
-            persist(self.screen_name or self.user_id or "trae", "trae", self.to_cred())
+            elif self.refresh_rejected:
+                # refresh 被拒，但 access token 尚未过期：继续用旧 token 签到
+                print("  [Trae] refreshToken 已失效，改用尚未过期的 accessToken 继续")
+                self._persist()
+            else:
+                print("  [Trae] token 刷新失败，改用现有 token 继续")
+                self._persist()
         elif self.device_id:
-            persist(self.screen_name or self.user_id or "trae", "trae", self.to_cred())
+            self._persist()
 
-        # 先查状态
+        # 先查状态（免费请求）。已签到立即收手，不消耗 claim。
         try:
             st = self.check_status()
             dbg(f"checkin status: {st}")
@@ -481,12 +627,44 @@ class Trae:
             result["status"] = f"查询状态失败: {e}"
             return self._finalize(result)
 
+        if st.get("code") == 1001:
+            fail = self._handle_auth_failure(result, "查询状态")
+            if fail:
+                result["status"] = fail
+                return self._finalize(result)
+            try:
+                st = self.check_status()
+                dbg(f"checkin status after refresh: {st}")
+                result["raw_status"] = st
+            except RuntimeError as e:
+                result["status"] = f"查询状态失败: {e}"
+                return self._finalize(result)
+            if st.get("code") == 1001:
+                result["status"] = "认证失败，无法确认领取状态"
+                return self._finalize(result)
+
+        if st.get("checked_in"):
+            cr = st.get("credits", 0)
+            result["status"] = f"今日已领取（status 确认）"
+            if cr:
+                result["status"] += f" +{cr}"
+            self._query_credits_safe(result)
+            return result
+
         # 领取积分（服务端可能限流返回 9074，重试几次）
         claim_retries = 3
         r = None
         auth_retried = False
         for attempt in range(1, claim_retries + 1):
             try:
+                if attempt > 1:
+                    # 重试前再查一次：已签到（手动或其他进程）立即收手
+                    st2 = self.check_status()
+                    if st2 and st2.get("checked_in"):
+                        result["raw_status"] = st2
+                        result["status"] = "今日已领取（重试前确认）"
+                        self._query_credits_safe(result)
+                        return result
                 r = self.do_claim()
                 dbg(f"claim attempt {attempt}: {r}")
                 code = r.get("code")
@@ -496,13 +674,12 @@ class Trae:
                     time.sleep(wait)
                     continue
                 if code == 1001 and not auth_retried:
-                    # 认证失败：token 可能已失效，刷新后立即重试一次
-                    print("  [Trae] 服务端认证失败(1001)，尝试刷新 token 后重试...")
+                    fail = self._handle_auth_failure(result, "领取")
+                    if fail:
+                        result["status"] = fail
+                        return self._finalize(result)
                     auth_retried = True
-                    if self.refresh():
-                        persist(self.screen_name or self.user_id or "trae", "trae", self.to_cred())
-                        continue
-                    dbg("token 刷新失败，保留原结果")
+                    continue
                 break
             except RuntimeError as e:
                 result["status"] = f"领取请求失败: {e}"
@@ -511,20 +688,15 @@ class Trae:
         result["raw_claim"] = r
         result["status"] = self._parse_claim_result(r)
 
-        # 查询积分
-        try:
-            cr = self.query_credits()
-            dbg(f"usage: {cr}")
-            result["raw_credits"] = cr
-            result["credits"] = self._parse_credits(cr)
-        except RuntimeError as e:
-            result["credits"] = f"查询积分失败: {e}"
+        self._query_credits_safe(result)
 
-        # HTTP 签到未成功时，走桌面端 UI 签到兜底
+        # HTTP 签到未成功时，走桌面端 UI 签到兜底（由开关控制，当前停用）
         return self._finalize(result)
 
     def _finalize(self, result: dict) -> dict:
-        """收尾：HTTP 路径失败时统一走 UI 兜底。"""
+        """收尾：HTTP 路径失败且开关开启时走 UI 兜底。"""
+        if not TRAE_UI_FALLBACK_ENABLED:
+            return result
         if should_fallback_to_ui(result.get("status", "")):
             ui_res = run_ui_checkin_fallback()
             result["ui_fallback"] = ui_res
@@ -547,6 +719,8 @@ class Trae:
 
     @staticmethod
     def _parse_claim_result(r: dict) -> str:
+        if not r:
+            return "领取请求无响应"
         code = r.get("code")
         msg = r.get("message") or r.get("Message") or ""
         data = r.get("data") or r.get("Result") or {}
@@ -559,7 +733,7 @@ class Trae:
                 return f"今日已领取 ({msg})"
         if code == 1001:
             # 1001 是服务端认证失败（"not able to authenticate"），
-            # 不能当作「今日已领取」，否则会掩盖真实失败、跳过兜底。
+            # 不能当作「今日已领取」，否则会掩盖真实失败。
             return f"认证失败，无法确认领取状态 ({msg})"
         return f"领取结果: code={code} msg={msg}"
 
@@ -631,18 +805,31 @@ def load_creds() -> list:
     return items
 
 
+def load_trae_cred() -> dict | None:
+    """重新扫描 auths/，返回最新一份 Trae 凭证。"""
+    for product, cred in load_creds():
+        if product == "trae":
+            return cred
+    return None
+
+
 # ---------------------------------------------------------------------------
 # 主入口
 # ---------------------------------------------------------------------------
 def main() -> int:
-    global DEBUG
+    global DEBUG, TRAE_UI_FALLBACK_ENABLED
     ap = argparse.ArgumentParser(description="WorkBuddy + Trae 每日自动签到")
     ap.add_argument("--debug", action="store_true", help="打印 HTTP 调试信息")
+    ap.add_argument("--ui-fallback", action="store_true",
+                    help="Trae HTTP 签到失败时启用桌面端 UI 签到兜底（默认关闭）")
     args = ap.parse_args()
     DEBUG = args.debug
+    TRAE_UI_FALLBACK_ENABLED = args.ui_fallback
     setup_file_log()
 
     print(f"=== 自动签到 {time.strftime('%Y-%m-%d %H:%M:%S')} ===")
+    if TRAE_UI_FALLBACK_ENABLED:
+        print("（已启用 Trae UI 签到兜底）")
     creds = load_creds()
     if not creds:
         print("未找到任何凭证。请先运行: python login.py")
@@ -664,13 +851,33 @@ def main() -> int:
             overall_ok = False
             continue
 
+        st = str(res.get("status", ""))
+        # Trae token 彻底失效：拉起 login.py 浏览器登录，成功后用新凭证再签一次
+        if product == "trae" and "token 失效" in st:
+            if run_trae_relogin():
+                new_cred = load_trae_cred()
+                if new_cred:
+                    print("  [Trae] 使用新凭证重新签到...")
+                    try:
+                        res = Trae(new_cred).run()
+                    except Exception as e:
+                        print(f"  发生异常: {e}")
+                        if DEBUG:
+                            traceback.print_exc()
+                        overall_ok = False
+                        continue
+                    st = str(res.get("status", ""))
+                else:
+                    print("  [Trae] 重新登录后仍未找到凭证")
+
         print(f"  状态: {res.get('status', '未知')}")
         if res.get("credits"):
             print(f"  积分: {res['credits']}")
-        st = str(res.get("status", ""))
-        # 明确的失败状态：token 失效、认证失败且兜底也没救回来、限流未领到
-        if any(k in st for k in ("token 失效", "认证失败", "UI 兜底失败",
-                                 "服务端限流，领取失败", "兜底超时", "兜底异常")):
+        # 明确的失败状态：token 失效、认证失败、限流未领到（UI 兜底开启时含兜底失败）
+        fail_keywords = ("token 失效", "认证失败", "服务端限流，领取失败")
+        if TRAE_UI_FALLBACK_ENABLED:
+            fail_keywords += ("UI 兜底失败", "兜底超时", "兜底异常")
+        if any(k in st for k in fail_keywords):
             overall_ok = False
 
     print("\n=== 完成 ===")
