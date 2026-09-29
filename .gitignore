@@ -1,4 +1,6 @@
 __pycache__/
+# 登录凭证含 accessToken/refreshToken，严禁提交
+auths/
 logs/*.png
 logs/_*.txt
 logs/_*.js
