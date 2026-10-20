@@ -1,11 +1,12 @@
-# Auto Checkin — WorkBuddy + Trae 每日自动签到
+# Auto Checkin — WorkBuddy + Trae + Qoder 每日自动签到
 
-每天自动领取 **WorkBuddy（腾讯 CodeBuddy 国内版）** 和 **Trae（字节 Trae Work）** 的每日积分。
+每天自动领取 **WorkBuddy（腾讯 CodeBuddy 国内版）**、**Trae（字节 Trae Work）** 和 **Qoder（阿里 Qoder 国内版）** 的每日积分。
 
 - HTTP 签到（`checkin.py` / `login.py`）零第三方依赖，纯 Python 标准库
 - OAuth 浏览器登录一次拿 token，之后自动刷新、自动签到
 - Windows 任务计划程序定时执行，token 不上云
 - `trae_ui_checkin.py` 是独立的手动 UI 签到工具；`checkin.py` 默认不调用，加 `--ui-fallback` 才在 HTTP 失败时兜底
+- Qoder 走官方 PAT（个人访问令牌）鉴权，无需抓包、无需解密客户端
 
 > ⚠️ 这是第三方逆向脚本，与官方无关，可能违反服务条款，接口随时可能失效。请自行评估风险后使用。
 
@@ -21,7 +22,8 @@ auto-checkin/
 ├── README.md            # 本文件
 ├── auths/               # 登录后自动生成，存放各账号凭证（请勿外传）
 │   ├── workbuddy-<uid>.json
-│   └── trae-<name>.json
+│   ├── trae-<name>.json
+│   └── qoder-<name>.json
 └── logs/                # 运行日志，自动生成
     ├── checkin.log
     └── trae_ui_checkin.log
@@ -41,17 +43,19 @@ auto-checkin/
 
 - 已注册 **腾讯 CodeBuddy（国内版）** 账号，能正常登录 [codebuddy.cn](https://www.codebuddy.cn)。注意：国际版 WorkBuddy（workbuddy.ai）无每日签到功能，本脚本只支持国内版。
 - 已注册 **Trae（国内版 trae.cn）** 账号，能正常登录。本脚本只支持国内版，海外版（trae.ai）账号体系不同。
+- 已注册 **Qoder（国内版 qoder.cn）** 账号，能正常登录 [qoder.cn](https://qoder.cn)，并在「集成设置」里创建好 PAT。国际版（qoder.sh）需改 `Qoder.BASE`。
 
 **系统与网络**
 
 - Python 已加入 PATH，命令行执行 `python --version` 能正确输出版本号
 - 运行 `login.py` 登录时，电脑能正常打开浏览器，且本机 `127.0.0.1` 回调端口（WorkBuddy 无需，Trae 用 18080）未被占用
-- 能访问 `codebuddy.cn`、`copilot.tencent.com`、`trae.cn`、`api.trae.cn`、`api.trae.com.cn` 这些域名（国内网络环境通常没问题）
+- 能访问 `codebuddy.cn`、`copilot.tencent.com`、`trae.cn`、`api.trae.cn`、`api.trae.com.cn`、`openapi.qoder.com.cn` 这些域名（国内网络环境通常没问题）
 
 **首次登录必须先做**
 
 - `checkin.py` 依赖 `auths/` 目录下的凭证文件，首次使用必须先跑 `python login.py workbuddy` 和 `python login.py trae` 完成登录，否则签到会提示"未找到任何凭证"
 - 登录时需要你本人在浏览器里扫码 / 验证码完成认证（脚本无法自动登录，这是平台安全要求）
+- Qoder 需要一个 PAT：登录时脚本会打开 [qoder.cn/account/integrations](https://qoder.cn/account/integrations)，你创建令牌后粘贴回终端即可
 
 **定时任务额外条件**
 
@@ -67,17 +71,19 @@ python --version
 
 ## 快速开始
 
-### 1. 首次登录（两个产品各登录一次）
+### 1. 首次登录（各产品各登录一次）
 
 分别执行，会自动打开浏览器，你扫码 / 验证码完成登录，token 自动存到 `auths/`：
 
 ```bash
 python login.py workbuddy
 python login.py trae
+python login.py qoder
 ```
 
 **WorkBuddy 登录流程**：脚本请求授权 state → 自动打开腾讯 SSO 登录页 → 你在浏览器完成登录 → 脚本轮询自动捕获 token。
 **Trae 登录流程**：脚本启动本地回调服务器 → 自动打开 trae.cn 登录页 → 你手机号验证码登录 → 浏览器跳转到 `127.0.0.1` 回调时脚本自动捕获 token（页面可能显示"打不开 127.0.0.1"是正常的，别关，脚本在后台接收回调）。
+**Qoder 登录流程**：Qoder 没有浏览器 OAuth，脚本打开「集成设置」页 → 你创建 PAT（`pt-` 开头）并粘贴回终端 → 脚本用 PAT 换一次 job token 校验有效性 → 存盘。PAT 长期有效，之后无需再登录。
 
 登录成功后命令行会显示用户名和凭证保存路径。凭证有效期通常 1-2 个月，到期前脚本会自动用 refreshToken 刷新。
 
@@ -91,6 +97,10 @@ python checkin.py
 
 ```
 === 自动签到 2026-08-20 09:45:27 ===
+
+[qoder]
+  状态: 领取成功
+  积分: 本次获得: 100 Credits
 
 [trae]
   状态: 领取成功
@@ -107,6 +117,12 @@ python checkin.py
 
 ```bash
 python checkin.py --debug
+```
+
+Qoder 每日额度轮次在上午才陆续发布，若执行时点太早会提示"本轮活动未下发"。默认会等 5 分钟重试，可用 `--qoder-wait` 调整等待时长：
+
+```bash
+python checkin.py --qoder-wait 15   # 最多等 15 分钟
 ```
 
 Trae HTTP 签到失败时，可用 `--ui-fallback` 让脚本自动调桌面端 UI 签到兜底（默认关闭）：
@@ -131,6 +147,7 @@ python trae_ui_checkin.py --dry-run  # 只定位，不点击
 cd C:\path\to\auto-checkin
 .\setup_task.ps1 -Install              # 默认每天 09:05 执行
 .\setup_task.ps1 -Install -Time 08:30  # 指定执行时间
+.\setup_task.ps1 -Install -ScriptArgs "--qoder-wait 15"  # 给脚本传额外参数
 ```
 
 常用操作：
@@ -151,6 +168,8 @@ cd C:\path\to\auto-checkin
 - token 过期前 24 小时脚本自动用 refreshToken 刷新，无需人工干预
 - 如果 refreshToken 也失效（长时间没跑、或平台强制下线），脚本会提示"会话已失效"，重新运行 `python login.py workbuddy` 或 `python login.py trae` 即可
 - Trae 多账号：再跑一次 `python login.py trae` 登录另一个账号，`auths/` 下会有多个 `trae-*.json`，`checkin.py` 会全部签到
+- Qoder 多账号：再跑一次 `python login.py qoder` 粘贴另一个账号的 PAT，`auths/` 下会有多个 `qoder-*.json`，`checkin.py` 会全部签到
+- Qoder 的 PAT 失效时报「PAT 无效或已过期 (HTTP 400)」，重新去控制台建一个 PAT 再 `python login.py qoder` 即可
 
 ## 常见问题
 
@@ -165,6 +184,12 @@ python trae_ui_checkin.py
 
 **Q: WorkBuddy 显示"今日已签到"是正常的吗？**
 正常。说明今天已经签到过了，脚本不再重复领取。
+
+**Q: Qoder 提示"本轮活动未下发"怎么办？**
+Qoder 每日额度轮次不是零点准时发布。默认脚本会每隔 60 秒重试，最多等 5 分钟；还拿不到就把任务时间调晚（如 `.\setup_task.ps1 -Install -Time 10:05`）或加大等待窗口（`--qoder-wait 20`）。当天补跑同样能领，claim 接口幂等不会多发。
+
+**Q: Qoder 提示"PAT 无效或已过期 (HTTP 400)"怎么办？**
+PAT 已被删除或过期。去 [qoder.cn/account/integrations](https://qoder.cn/account/integrations) 重新创建一个，再运行 `python login.py qoder` 粘贴新令牌。
 
 **Q: 任务计划没按时执行？**
 
@@ -184,7 +209,7 @@ python trae_ui_checkin.py
 - **签到**：`POST www.codebuddy.cn/v2/billing/meter/daily-checkin`，鉴权头 `Authorization: Bearer <accessToken>`（实测必须带 Bearer 前缀，无前缀返回 401）。
 - **签到返回**：`data.credit`（本次积分）、`data.streak_days`（连续天数）。
 - **积分查询**：`POST www.codebuddy.cn/v2/billing/meter/get-user-resource`，积分字段 `data.Response.Data.TotalDosage`。
-- **刷新**：`POST copilot.tencent.com/v2/plugin/auth/token/refresh`，body `{"refreshToken": ...}`。
+- **刷新**：`POST copilot.tencent.com/v2/plugin/auth/token/refresh`。⚠️ 该接口**不读 body**，refreshToken 必须放在请求头 `X-Refresh-Token`（另带 `X-Auth-Refresh-Source: workbuddy`），body 传 `{"refreshToken": ...}` 会返回 `10001:refreshToken is empty`。
 
 ### Trae（Trae Work 积分）
 
@@ -193,6 +218,15 @@ python trae_ui_checkin.py
 - **积分查询**：`POST api.trae.cn/trae/api/v2/pay/ide_user_ent_usage`，从 `user_entitlement_pack_list` 权益包汇总 `credits_limit`。
 - **刷新**：`POST api.trae.com.cn/cloudide/api/v3/trae/oauth/ExchangeToken`，body `ClientID/RefreshToken/ClientSecret:"-"/UserID`，返回 `Result.Token` 和 `Result.BoundDeviceID`（作为签到用 deviceId）。
 - **9074 限流**：claim 接口被服务端限流时返回 `code:9074 当前参与用户太多`，脚本自动重试 3 次后明确报告。
+
+### Qoder（阿里 Qoder 国内版）
+
+- **鉴权**：PAT（Personal Access Token，在 [qoder.cn/account/integrations](https://qoder.cn/account/integrations) 创建，以 `pt-` 开头）。没有 OAuth 流程，PAT 长期有效，脚本不保存任何可续期的会话。
+- **换 job token**：`POST openapi.qoder.com.cn/api/v1/jobToken/exchange`，body `{"personal_token": "<PAT>"}`（服务端另认 `personal_access_token` 字段名，脚本两种依次尝试）。每次签到前换一次短期 job token。
+- **查活动**：`GET openapi.qoder.com.cn/sash/api/v1/me/campaigns`，鉴权头 `Authorization: Bearer <jobToken>` + `Cosy-ClientType: 10`。取 `actionType == "CLAIM_BENEFIT"` 且 `claimStatus == "CLAIMABLE"` 的活动。
+- **领取**：`POST openapi.qoder.com.cn/sash/api/v1/me/campaigns/{id}/claim`，幂等，重复调用不会多发。响应 `data.benefit.amount` 是本次到账 Credits。
+- **状态判定**：`CLAIMABLE` → 领取；`CLAIMED` 且在有效期（`startAt/endAt`）内 → 今日已领取；列表为空 → 本轮活动未下发（每日轮次 10:00 刷新，脚本每 60 秒重查，默认最多等 5 分钟，`--qoder-wait` 可调）。
+- **实测**：无效 PAT 时服务端返回 **HTTP 400**（不是 401），错误体为 `{"errorCode":"BadRequest",...}`。
 
 ## 参照的开源仓库
 
@@ -203,13 +237,17 @@ python trae_ui_checkin.py
 | WorkBuddy | [Maquer/workbuddy-checkin](https://github.com/Maquer/workbuddy-checkin)     | Python 标准库，端点最全最准，Docker/cron 部署           |
 | Trae      | [baokun-l/trae-work-checkin](https://github.com/baokun-l/trae-work-checkin) | Python 标准库，OAuth 登录 + claim + 计划任务            |
 | Trae      | [inlayin/trae-check](https://github.com/inlayin/trae-check)                 | Electron 桌面 GUI，多账号管理，参考了其设备 ID 去重策略 |
+| Qoder     | [wzhu22750-lang/qoder_checkin](https://github.com/wzhu22750-lang/qoder_checkin) | PAT 换 job token + campaigns + claim，端点最简          |
+| Qoder     | [wallechfox/qoder-checkin](https://github.com/wallechfox/qoder-checkin)     | 客户端 DPAPI 解密 + Cosy 设备头 + 青龙部署（备选方案）   |
 
 实测中根据真实接口返回修正了以下差异（与参考仓库不同）：
 
 - WorkBuddy 鉴权头需加 `Bearer` 前缀（参考仓库写的是无前缀，实测 401）
 - WorkBuddy 登录返回字段为驼峰命名（`accessToken` 而非 `access_token`）
+- WorkBuddy **刷新接口要求把 refreshToken 放在 `X-Refresh-Token` 请求头**（放 body 会报 `10001:refreshToken is empty`，2026-10-20 修复，此前 WorkBuddy 连续两天签到失败）
 - Trae 登录回调实际只返回 `refreshToken`/`data`/`refreshExpireAt`，无 `userInfo`/`userJwt`
 - Trae 签到用 `ExchangeToken` 返回的 `BoundDeviceID` 作为 deviceId
+- Qoder 无效 PAT 返回的是 **HTTP 400**（不是 401），两种字段名 `personal_token` / `personal_access_token` 依次尝试
 
 ## 推广
 

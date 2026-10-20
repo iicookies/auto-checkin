@@ -15,6 +15,7 @@
 用法:
     python login.py workbuddy        # 登录 WorkBuddy (CodeBuddy 国内版)
     python login.py trae              # 登录 Trae
+    python login.py qoder             # 登录 Qoder (粘贴 PAT)
     python login.py trae --debug       # 打印调试信息
 
 注意:
@@ -131,10 +132,16 @@ def http_request(method: str, url: str, headers: dict, body: dict | None = None,
     except urllib.error.HTTPError as e:
         raw = e.read().decode("utf-8", errors="replace") if e.fp else ""
         dbg(f"  {method} {url} -> HTTP {e.code} {raw[:300]}")
+        # 错误响应统一带上状态码，便于区分「HTTP 400 + 业务错误体」
         try:
-            return json.loads(raw) if raw else {"_status": e.code}
+            body = json.loads(raw) if raw else {}
         except json.JSONDecodeError:
-            return {"_raw": raw, "_status": e.code}
+            body = {"_raw": raw}
+        if isinstance(body, dict):
+            body["_status"] = e.code
+        else:
+            body = {"_raw": raw, "_status": e.code}
+        return body
 
 
 # ---------------------------------------------------------------------------
@@ -359,6 +366,121 @@ def login_trae() -> int:
 
 
 # ---------------------------------------------------------------------------
+# Qoder 登录（PAT）
+# ---------------------------------------------------------------------------
+QODER_PAT_URL = "https://qoder.cn/account/integrations"
+QODER_BASE = "https://openapi.qoder.com.cn"
+
+
+def _jwt_claims(token: str) -> dict:
+    """解析 JWT payload 段（非 JWT 返回空 dict）。"""
+    try:
+        import base64
+        if not token or token.count(".") < 2:
+            return {}
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        obj = json.loads(base64.urlsafe_b64decode(payload))
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def login_qoder() -> int:
+    """Qoder 没有浏览器 OAuth，取而代之是控制台生成的 PAT。
+
+    流程：
+      1. 打开 Qoder 控制台「集成设置」页
+      2. 用户粘贴以 pt- 开头的 Personal Access Token
+      3. 用 PAT 换一次 job token 校验有效性
+      4. 存盘到 auths/qoder-<name>.json
+    """
+    print("  Qoder 不走浏览器 OAuth，需要手工粘贴 Personal Access Token (PAT)。")
+    print(f"  1. 浏览器打开: {QODER_PAT_URL}  （Qoder 控制台 → 集成设置）")
+    print("  2. 创建个人访问令牌，复制以 pt- 开头的令牌")
+    try:
+        webbrowser.open(QODER_PAT_URL)
+    except Exception as e:
+        dbg(f"打开浏览器失败: {e}")
+    print("  3. 粘贴 PAT 后回车（直接回车取消）:")
+
+    try:
+        pat = input().strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\n  已取消。")
+        return 1
+
+    if not pat:
+        print("  未输入 PAT，已取消。")
+        return 1
+    if not pat.lower().startswith("pt-"):
+        print(f"  ⚠️ PAT 一般以 pt- 开头，当前是: {pat[:6]}***")
+
+    # 校验：PAT 换 job token
+    headers = {"Content-Type": "application/json", "Accept": "application/json",
+               "User-Agent": "Qoder"}
+    token = ""
+    resp = {}
+    for field in ("personal_token", "personal_access_token"):
+        try:
+            resp = http_request("POST", f"{QODER_BASE}/api/v1/jobToken/exchange",
+                                headers, {field: pat})
+        except Exception as e:
+            print(f"  ❌ 校验请求失败: {e}")
+            return 1
+        dbg(f"Qoder exchange({field}) -> {resp}")
+        token = resp.get("token") or resp.get("job_token") or resp.get("jobToken")
+        if token:
+            break
+
+    if not token:
+        status = resp.get("_status") if isinstance(resp, dict) else 0
+        body = {k: v for k, v in resp.items() if k != "_status"} if isinstance(resp, dict) else {}
+        detail = json.dumps(body, ensure_ascii=False)[:300] if body else "(空响应)"
+        print(f"  ❌ PAT 校验失败（HTTP {status or '?'}），无法换取 job token: {detail}")
+        print("  请确认令牌已在 qoder.cn/account/integrations 创建且未过期，然后重试。")
+        return 1
+
+    # 尝试从 job token 里取个稳定标识当账号名，取不到就用 "qoder"
+    claims = _jwt_claims(token)
+    name = ""
+    for k in ("sub", "uid", "user_id", "userId", "id", "email"):
+        v = claims.get(k)
+        if v:
+            name = str(v)
+            break
+    name = name or "qoder"
+
+    cred = {
+        "name": name,
+        "pat": pat,
+        "createdAt": time.time(),
+    }
+    p = CRED_DIR / f"qoder-{name}.json"
+    # 已有同名文件但 PAT 不同（不同账号），加数字后缀避免覆盖
+    if p.is_file():
+        try:
+            old = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            old = {}
+        if old.get("pat") and old.get("pat") != pat:
+            i = 2
+            while (CRED_DIR / f"qoder-{name}{i}.json").is_file():
+                i += 1
+            name = f"{name}{i}"
+            cred["name"] = name
+            p = CRED_DIR / f"qoder-{name}.json"
+
+    p.write_text(json.dumps(cred, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    print(f"\n  ✅ Qoder 登录成功")
+    print(f"  账号: {name}")
+    print(f"  凭证已保存: {p}")
+    print(f"\n  提示: PAT 长期有效，签到时脚本会用它换短期 job token，无需刷新。")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # 入口
 # ---------------------------------------------------------------------------
 def main() -> int:
@@ -371,7 +493,7 @@ def main() -> int:
             pass
     ap = argparse.ArgumentParser(description="首次 OAuth 登录，获取签到凭证")
 
-    ap.add_argument("product", choices=["workbuddy", "trae"], help="要登录的产品")
+    ap.add_argument("product", choices=["workbuddy", "trae", "qoder"], help="要登录的产品")
     ap.add_argument("--debug", action="store_true", help="打印调试信息")
     args = ap.parse_args()
     DEBUG = args.debug
@@ -380,6 +502,8 @@ def main() -> int:
     try:
         if args.product == "workbuddy":
             return login_workbuddy()
+        elif args.product == "qoder":
+            return login_qoder()
         else:
             return login_trae()
     except KeyboardInterrupt:

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-每日自动签到：WorkBuddy (CodeBuddy 国内版) + Trae (Trae Work 积分)。
+每日自动签到：WorkBuddy (CodeBuddy 国内版) + Trae (Trae Work 积分) + Qoder (阿里 Qoder)。
 
 零第三方依赖，仅使用 Python 标准库。
 凭证由 login.py 一次性 OAuth 登录获取并存盘，本脚本负责：
@@ -24,6 +24,7 @@ import subprocess
 import sys
 import time
 import traceback
+import urllib.parse
 import urllib.request
 import urllib.error
 from pathlib import Path
@@ -43,6 +44,10 @@ LOG_DIR.mkdir(exist_ok=True)
 LOG_PATH = LOG_DIR / "checkin.log"
 
 DEBUG = False
+
+# Qoder 每日额度轮次不是零点准时发布，签到时若查不到可领活动就等待重试（分钟）。
+# 可用命令行 --qoder-wait 调整。
+QODER_WAIT_MINUTES = 5
 
 
 class _Tee:
@@ -77,6 +82,19 @@ def setup_file_log() -> None:
 def dbg(msg: str) -> None:
     if DEBUG:
         print(f"    [debug] {msg}", flush=True)
+
+
+def is_auth_fail(resp: dict) -> bool:
+    """鉴权失败判定：业务码 1001，或 HTTP 401/403。
+
+    部分接口在 token 失效时直接返回 HTTP 401（而不是 200 + code:1001），
+    统一在这里判定，避免把认证失败误报成「未签到」。
+    """
+    if not isinstance(resp, dict):
+        return False
+    if resp.get("code") == 1001:
+        return True
+    return resp.get("_status") in (401, 403)
 
 
 # ---------------------------------------------------------------------------
@@ -232,10 +250,17 @@ def http_request(method: str, url: str, headers: dict, body: dict | None = None,
     except urllib.error.HTTPError as e:
         raw = e.read().decode("utf-8", errors="replace") if e.fp else ""
         dbg(f"  HTTPError {e.code}: {raw[:500]}")
+        # 统一带上状态码：body 是 JSON 时也塞进 _status，
+        # 否则调用方无法区分「HTTP 400 + 业务错误体」和「HTTP 200 + 业务错误体」
         try:
-            return json.loads(raw) if raw else {"_status": e.code}
+            body = json.loads(raw) if raw else {}
         except json.JSONDecodeError:
-            return {"_raw": raw, "_status": e.code}
+            body = {"_raw": raw}
+        if isinstance(body, dict):
+            body["_status"] = e.code
+        else:
+            body = {"_raw": raw, "_status": e.code}
+        return body
     except urllib.error.URLError as e:
         raise RuntimeError(f"网络请求失败: {e.reason}") from e
 
@@ -265,22 +290,29 @@ class WorkBuddy:
         return self.expires_at - time.time() < REFRESH_MARGIN
 
     def refresh(self) -> bool:
-        """用 refreshToken 换新 accessToken，成功则更新内存并返回 True。"""
-        headers = {"User-Agent": self.UA, "Content-Type": "application/json"}
-        body = {"refreshToken": self.refresh_token}
+        """用 refreshToken 换新 accessToken，成功则更新内存并返回 True。
+
+        实测（2026-10-20）：token/refresh 接口**不读 body**，必须把 refreshToken
+        放在 `X-Refresh-Token` 请求头里；把 refreshToken 放进 JSON body 会返回
+        `10001:refreshToken is empty`。参考 Maquer/workbuddy-checkin 的实现。
+        """
+        headers = {
+            "User-Agent": self.UA,
+            "Content-Type": "application/json",
+            "X-Refresh-Token": self.refresh_token,
+            "X-Auth-Refresh-Source": "workbuddy",
+        }
         try:
             data = http_request("POST", f"{self.AUTH_BASE}/v2/plugin/auth/token/refresh",
-                                headers, body)
+                                headers, body={})
         except RuntimeError as e:
             dbg(f"WorkBuddy 刷新请求失败: {e}")
             return False
 
-        new_access = (data.get("data") or {}).get("accessToken") \
-            or (data.get("data") or {}).get("access_token")
-        new_refresh = (data.get("data") or {}).get("refreshToken") \
-            or (data.get("data") or {}).get("refresh_token") or self.refresh_token
-        expires_in = (data.get("data") or {}).get("expiresIn") \
-            or (data.get("data") or {}).get("expires_in", 0)
+        payload = data.get("data") if isinstance(data.get("data"), dict) else data
+        new_access = payload.get("accessToken") or payload.get("access_token")
+        new_refresh = payload.get("refreshToken") or payload.get("refresh_token") or self.refresh_token
+        expires_in = payload.get("expiresIn") or payload.get("expires_in", 0)
 
         if not new_access:
             dbg(f"WorkBuddy 刷新返回无 token: {data}")
@@ -289,6 +321,8 @@ class WorkBuddy:
         self.access_token = new_access
         self.refresh_token = new_refresh
         self.expires_at = time.time() + (expires_in or 7 * 24 * 3600)
+        if payload.get("domain"):
+            self.domain = payload["domain"]
         dbg(f"WorkBuddy token 已刷新，新过期时间 {time.strftime('%Y-%m-%d %H:%M', time.localtime(self.expires_at))}")
         return True
 
@@ -337,6 +371,9 @@ class WorkBuddy:
         if any(m in raw for m in self.DEAD_MARKERS):
             result["status"] = "会话已失效，请重新登录 (login.py)"
             return result
+        if is_auth_fail(st):
+            result["status"] = "认证失败，token 可能已失效，请重新登录 (login.py workbuddy)"
+            return result
 
         # 执行签到
         try:
@@ -364,6 +401,8 @@ class WorkBuddy:
         code = r.get("code")
         msg = r.get("message") or r.get("msg") or ""
         data = r.get("data") or {}
+        if r.get("_status") in (401, 403):
+            return f"认证失败，无法签到 (HTTP {r['_status']})"
         if code in (0, 200) or r.get("success"):
             credit = data.get("credit")
             streak = data.get("streak_days")
@@ -627,7 +666,7 @@ class Trae:
             result["status"] = f"查询状态失败: {e}"
             return self._finalize(result)
 
-        if st.get("code") == 1001:
+        if is_auth_fail(st):
             fail = self._handle_auth_failure(result, "查询状态")
             if fail:
                 result["status"] = fail
@@ -639,7 +678,7 @@ class Trae:
             except RuntimeError as e:
                 result["status"] = f"查询状态失败: {e}"
                 return self._finalize(result)
-            if st.get("code") == 1001:
+            if is_auth_fail(st):
                 result["status"] = "认证失败，无法确认领取状态"
                 return self._finalize(result)
 
@@ -673,7 +712,7 @@ class Trae:
                     print(f"  [Trae] 服务端限流(9074)，{wait}秒后重试({attempt}/{claim_retries})...")
                     time.sleep(wait)
                     continue
-                if code == 1001 and not auth_retried:
+                if is_auth_fail(r) and not auth_retried:
                     fail = self._handle_auth_failure(result, "领取")
                     if fail:
                         result["status"] = fail
@@ -735,6 +774,8 @@ class Trae:
             # 1001 是服务端认证失败（"not able to authenticate"），
             # 不能当作「今日已领取」，否则会掩盖真实失败。
             return f"认证失败，无法确认领取状态 ({msg})"
+        if r.get("_status") in (401, 403):
+            return f"认证失败，无法确认领取状态 (HTTP {r['_status']})"
         return f"领取结果: code={code} msg={msg}"
 
     @staticmethod
@@ -775,6 +816,246 @@ class Trae:
 
 
 # ---------------------------------------------------------------------------
+# Qoder (阿里 Qoder 国内版)
+# ---------------------------------------------------------------------------
+class Qoder:
+    """阿里 Qoder 国内版（qoder.cn）每日 100 Credits 领取。
+
+    与 Trae / WorkBuddy 不同，Qoder 没有浏览器 OAuth 登录态可拿，取而代之的是
+    网页控制台生成的 PAT（Personal Access Token，以 pt- 开头）：
+
+      1. PAT 换短期 job token：POST /api/v1/jobToken/exchange
+      2. 查当天活动：         GET  /sash/api/v1/me/campaigns
+      3. 领取可领活动：       POST /sash/api/v1/me/campaigns/{id}/claim
+
+    凭据只有一个 PAT（没有 refreshToken），所以不参与 token 刷新流程；
+    每次运行重新兑换 job token 即可，claim 接口幂等，重复跑不会多领。
+    参考实现：wzhu22750-lang/qoder_checkin
+    """
+
+    BASE = "https://openapi.qoder.com.cn"
+    UA = "Qoder"
+
+    # 每天的额度活动类型 / 领取状态
+    ACTION_CLAIM = "CLAIM_BENEFIT"
+    STATUS_CLAIMABLE = "CLAIMABLE"
+    STATUS_CLAIMED = "CLAIMED"
+
+    def __init__(self, cred: dict, name: str = "qoder"):
+        self.pat = str(cred.get("pat") or cred.get("accessToken") or "").strip()
+        self.name = cred.get("name") or name
+        self.token = ""  # 短期 job token，每次运行兑换
+
+    # --- HTTP -------------------------------------------------------------
+    def _plain_headers(self) -> dict:
+        return {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": self.UA,
+        }
+
+    def _auth_headers(self) -> dict:
+        return {
+            "Accept": "application/json",
+            "User-Agent": self.UA,
+            "Cosy-ClientType": "10",
+            "Authorization": f"Bearer {self.token}",
+        }
+
+    def exchange(self) -> tuple[bool, str]:
+        """用 PAT 换 job token。返回 (是否成功, 失败原因)。
+
+        实测：无效 PAT 时服务端返回 HTTP 400（不是 401），所以 400/401/403
+        都要归到「PAT 无效」这一类；字段名两种写法依次尝试，任一成功即可。
+        """
+        last_err = ""
+        auth_status = 0
+        auth_detail = ""
+        for field in ("personal_token", "personal_access_token"):
+            try:
+                data = http_request("POST", f"{self.BASE}/api/v1/jobToken/exchange",
+                                    self._plain_headers(), {field: self.pat})
+            except RuntimeError as e:
+                last_err = f"网络请求失败: {e}"
+                continue
+
+            dbg(f"Qoder exchange({field}): {data}")
+            token = data.get("token") or data.get("job_token") or data.get("jobToken")
+            if token:
+                self.token = token
+                return True, ""
+            status = data.get("_status") or 0
+            if status in (400, 401, 403) and not auth_status:
+                auth_status = status
+                auth_detail = str(data.get("errorCode") or data.get("errorMessage") or "")
+            body = {k: v for k, v in data.items() if k != "_status"}
+            last_err = json.dumps(body, ensure_ascii=False)[:200] if body else f"HTTP {status}"
+
+        if auth_status:
+            suffix = f" [{auth_detail}]" if auth_detail else ""
+            return False, f"PAT 无效或已过期 (HTTP {auth_status}){suffix}"
+        return False, last_err or "换取 job token 失败"
+
+    def get_campaigns(self) -> dict:
+        """返回当天活动的原始响应（由调用方解析，便于识别鉴权失败）。"""
+        data = http_request("GET", f"{self.BASE}/sash/api/v1/me/campaigns",
+                            self._auth_headers())
+        dbg(f"Qoder campaigns: {data}")
+        return data if isinstance(data, dict) else {}
+
+    def claim(self, cid: str) -> dict:
+        """领取指定活动。接口幂等，重复调用不会多发。"""
+        url = f"{self.BASE}/sash/api/v1/me/campaigns/{urllib.parse.quote(cid)}/claim"
+        data = http_request("POST", url, self._auth_headers(), body={})
+        dbg(f"Qoder claim({cid}): {data}")
+        return data
+
+    # --- 主流程 ------------------------------------------------------------
+    def run(self) -> dict:
+        result = {"product": "Qoder", "name": self.name}
+
+        if not self.pat:
+            result["status"] = "未配置 PAT，请先运行: python login.py qoder"
+            return result
+
+        # 每日轮次不是零点准时发布，查不到活动时每隔 60s 重试（最多 QODER_WAIT_MINUTES 次）
+        max_attempts = max(1, 1 + QODER_WAIT_MINUTES)
+        for attempt in range(1, max_attempts + 1):
+            ok, err = self.exchange()
+            if not ok:
+                result["status"] = f"{err}，请重新运行: python login.py qoder"
+                return result
+
+            try:
+                resp = self.get_campaigns()
+            except RuntimeError as e:
+                result["status"] = f"查询活动失败: {e}"
+                return result
+
+            if is_auth_fail(resp):
+                result["status"] = "job token 无效（PAT 可能已失效），请重新运行: python login.py qoder"
+                return result
+
+            campaigns = resp.get("campaigns")
+            if not isinstance(campaigns, list):
+                campaigns = []
+            benefits = [c for c in campaigns
+                        if isinstance(c, dict) and c.get("actionType") == self.ACTION_CLAIM]
+            claimable = [c for c in benefits
+                         if c.get("claimStatus") == self.STATUS_CLAIMABLE]
+
+            if claimable:
+                total, fails = 0.0, []
+                for c in claimable:
+                    cid = str(c.get("campaignId") or c.get("id") or "")
+                    if not cid:
+                        fails.append("活动缺少 id")
+                        continue
+                    r = None
+                    for try_claim in range(2):  # 最多重试一次（job token 中途过期）
+                        try:
+                            r = self.claim(cid)
+                        except RuntimeError as e:
+                            fails.append(f"领取请求失败: {e}")
+                            r = None
+                            break
+                        if not is_auth_fail(r):
+                            break
+                        # job token 过期：重新兑换后再试一次
+                        dbg("Qoder claim 鉴权失败，重新兑换 job token 后重试")
+                        ok2, err2 = self.exchange()
+                        if not ok2:
+                            fails.append(f"重新兑换 job token 失败: {err2}")
+                            break
+                    if r is None:
+                        continue
+                    body = r.get("data") if isinstance(r.get("data"), dict) else r
+                    ok_claim = (isinstance(body, dict)
+                                and (body.get("status") == self.STATUS_CLAIMED
+                                     or body.get("replayed") is True))
+                    if not ok_claim:
+                        fails.append(f"领取未成功: {json.dumps(r, ensure_ascii=False)[:120]}")
+                        continue
+                    amt = self._amount(body) or self._amount(c)
+                    total += amt or 0
+                if fails:
+                    result["status"] = f"部分活动领取失败（{len(fails)}/{len(claimable)}）: {fails[0]}"
+                else:
+                    result["status"] = "领取成功"
+                    if total:
+                        result["credits"] = f"本次获得: {total:g} Credits"
+                return result
+
+            if any(c.get("claimStatus") == self.STATUS_CLAIMED and self._in_window(c)
+                   for c in benefits):
+                result["status"] = "今日已领取"
+                return result
+
+            if attempt < max_attempts:
+                print(f"  [Qoder] 本轮活动未下发，60 秒后重试({attempt}/{max_attempts - 1})...")
+                time.sleep(60)
+                continue
+
+            result["status"] = "本轮活动未下发（暂无可领的 CLAIM_BENEFIT 活动），稍后可重跑"
+            return result
+
+        return result
+
+    @staticmethod
+    def _in_window(c: dict) -> bool:
+        """活动是否在有效期（startAt/endAt 为 epoch 秒，兼容毫秒）。
+
+        时间缺失或无法解析时按「在窗口内」宽松处理，避免时钟偏差把
+        还能领的活动漏掉；只用于过滤已过期的 CLAIMED 轮次，防止把
+        残留的旧轮次误报成「今日已领取」。
+        """
+        if not isinstance(c, dict):
+            return True
+
+        def to_epoch(v) -> float | None:
+            if isinstance(v, (int, float)) and v > 0:
+                return v / 1000.0 if v > 1e12 else float(v)
+            return None
+
+        now = time.time()
+        start, end = to_epoch(c.get("startAt")), to_epoch(c.get("endAt"))
+        if start is not None and now < start:
+            return False
+        if end is not None and now > end:
+            return False
+        return True
+
+    @staticmethod
+    def _amount(node) -> float | None:
+        """从响应/活动节点里取 benefit.amount。"""
+        if not isinstance(node, dict):
+            return None
+        benefit = node.get("benefit")
+        if isinstance(benefit, dict):
+            for k in ("amount", "value", "credits"):
+                v = benefit.get(k)
+                if v is not None:
+                    try:
+                        return float(v)
+                    except (TypeError, ValueError):
+                        pass
+        for k in ("amount", "credits"):
+            v = node.get(k)
+            if v is not None:
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    pass
+        return None
+
+    def to_cred(self) -> dict:
+        return {
+            "name": self.name,
+            "pat": self.pat,
+        }
+
+
+# ---------------------------------------------------------------------------
 # 凭证读写
 # ---------------------------------------------------------------------------
 def cred_path(name: str, product: str) -> Path:
@@ -800,6 +1081,11 @@ def load_creds() -> list:
             items.append(("workbuddy", data))
         elif stem.startswith("trae-"):
             items.append(("trae", data))
+        elif stem.startswith("qoder-"):
+            # 文件名后缀作为账号名（PAT 本身没有稳定 uid 可用）
+            if not data.get("name"):
+                data["name"] = stem[len("qoder-"):] or "qoder"
+            items.append(("qoder", data))
         else:
             print(f"  跳过未知凭证文件 {p.name}")
     return items
@@ -817,14 +1103,17 @@ def load_trae_cred() -> dict | None:
 # 主入口
 # ---------------------------------------------------------------------------
 def main() -> int:
-    global DEBUG, TRAE_UI_FALLBACK_ENABLED
-    ap = argparse.ArgumentParser(description="WorkBuddy + Trae 每日自动签到")
+    global DEBUG, TRAE_UI_FALLBACK_ENABLED, QODER_WAIT_MINUTES
+    ap = argparse.ArgumentParser(description="WorkBuddy + Trae + Qoder 每日自动签到")
     ap.add_argument("--debug", action="store_true", help="打印 HTTP 调试信息")
     ap.add_argument("--ui-fallback", action="store_true",
                     help="Trae HTTP 签到失败时启用桌面端 UI 签到兜底（默认关闭）")
+    ap.add_argument("--qoder-wait", type=int, default=5, metavar="MIN",
+                    help="Qoder 本轮活动未下发时最多等待多少分钟（默认 5）")
     args = ap.parse_args()
     DEBUG = args.debug
     TRAE_UI_FALLBACK_ENABLED = args.ui_fallback
+    QODER_WAIT_MINUTES = max(0, args.qoder_wait)
     setup_file_log()
 
     print(f"=== 自动签到 {time.strftime('%Y-%m-%d %H:%M:%S')} ===")
@@ -842,6 +1131,8 @@ def main() -> int:
         try:
             if product == "workbuddy":
                 res = WorkBuddy(cred).run()
+            elif product == "qoder":
+                res = Qoder(cred).run()
             else:
                 res = Trae(cred).run()
         except Exception as e:
@@ -877,6 +1168,9 @@ def main() -> int:
         fail_keywords = ("token 失效", "认证失败", "服务端限流，领取失败")
         if TRAE_UI_FALLBACK_ENABLED:
             fail_keywords += ("UI 兜底失败", "兜底超时", "兜底异常")
+        # Qoder 专属失败态（PAT 前缀可以覆盖 PAT 无效 / PAT 可能已失效等所有情况）
+        if product == "qoder":
+            fail_keywords += ("PAT", "未配置", "部分活动领取失败", "活动未下发", "查询活动失败", "job token 无效")
         if any(k in st for k in fail_keywords):
             overall_ok = False
 

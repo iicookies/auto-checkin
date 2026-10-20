@@ -1,8 +1,9 @@
-# 注册 / 卸载 Windows 任务计划，每天定时执行签到。
+﻿# 注册 / 卸载 Windows 任务计划，每天定时执行签到。
 #
 # 用法（以管理员身份运行 PowerShell）:
 #   .\setup_task.ps1 -Install          # 注册每天 09:05 执行的任务
 #   .\setup_task.ps1 -Time 08:30       # 注册并指定时间
+#   .\setup_task.ps1 -Install -ScriptArgs "--qoder-wait 15"   # 给脚本传额外参数
 #   .\setup_task.ps1 -Uninstall       # 卸载任务
 #   .\setup_task.ps1 -RunNow          # 立即执行一次签到
 #   .\setup_task.ps1 -Status          # 查看任务状态
@@ -15,7 +16,8 @@ param(
     [switch]$Uninstall,
     [switch]$RunNow,
     [switch]$Status,
-    [string]$Time = "09:05"
+    [string]$Time = "09:05",
+    [string]$ScriptArgs = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -78,11 +80,13 @@ if ($Install) {
     # 校验时间格式
     $t = Get-Date $Time -ErrorAction Stop
 
-    # 构造动作：python checkin.py
+    # 构造动作：python checkin.py（可带额外参数，如 --qoder-wait 15）
     # 日志由 checkin.py 内部的 logging.FileHandler 写入 logs\checkin.log，不需要 shell 重定向
+    $argLine = "`"$CheckinScript`""
+    if ($ScriptArgs) { $argLine += " $ScriptArgs" }
     $action = New-ScheduledTaskAction `
         -Execute $Python `
-        -Argument "`"$CheckinScript`"" `
+        -Argument $argLine `
         -WorkingDirectory $ScriptDir
 
     # 每天定时触发
@@ -95,7 +99,6 @@ if ($Install) {
         -DontStopIfGoingOnBatteries `
         -AllowStartIfOnBatteries `
         -ExecutionTimeLimit (New-TimeSpan -Minutes 20) `
-
         -RestartCount 2 `
         -RestartInterval (New-TimeSpan -Minutes 15)
 
