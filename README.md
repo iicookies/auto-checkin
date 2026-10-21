@@ -145,7 +145,7 @@ python trae_ui_checkin.py --dry-run  # 只定位，不点击
 
 ```powershell
 cd C:\path\to\auto-checkin
-.\setup_task.ps1 -Install              # 默认每天 09:05 执行
+.\setup_task.ps1 -Install              # 默认每天 10:05 执行
 .\setup_task.ps1 -Install -Time 08:30  # 指定执行时间
 .\setup_task.ps1 -Install -ScriptArgs "--qoder-wait 15"  # 给脚本传额外参数
 ```
@@ -186,7 +186,7 @@ python trae_ui_checkin.py
 正常。说明今天已经签到过了，脚本不再重复领取。
 
 **Q: Qoder 提示"本轮活动未下发"怎么办？**
-Qoder 每日额度轮次不是零点准时发布。默认脚本会每隔 60 秒重试，最多等 5 分钟；还拿不到就把任务时间调晚（如 `.\setup_task.ps1 -Install -Time 10:05`）或加大等待窗口（`--qoder-wait 20`）。当天补跑同样能领，claim 接口幂等不会多发。
+Qoder 每日额度轮次不是零点准时发布，而是每天 **10:00（UTC+8）** 刷新（脚本默认重试窗口 5 分钟）。所以定时任务默认设在 10:05；仍拿不到就把任务时间调晚（如 `.\setup_task.ps1 -Install -Time 10:30`）或加大等待窗口（`--qoder-wait 20`）。当天补跑同样能领，claim 接口幂等不会多发。
 
 **Q: Qoder 提示"PAT 无效或已过期 (HTTP 400)"怎么办？**
 PAT 已被删除或过期。去 [qoder.cn/account/integrations](https://qoder.cn/account/integrations) 重新创建一个，再运行 `python login.py qoder` 粘贴新令牌。
@@ -232,13 +232,13 @@ PAT 已被删除或过期。去 [qoder.cn/account/integrations](https://qoder.cn
 
 本脚本的接口端点、登录流程和请求格式参考了以下开源项目，致谢原作者：
 
-| 产品      | 仓库                                                                        | 说明                                                    |
-| --------- | --------------------------------------------------------------------------- | ------------------------------------------------------- |
-| WorkBuddy | [Maquer/workbuddy-checkin](https://github.com/Maquer/workbuddy-checkin)     | Python 标准库，端点最全最准，Docker/cron 部署           |
-| Trae      | [baokun-l/trae-work-checkin](https://github.com/baokun-l/trae-work-checkin) | Python 标准库，OAuth 登录 + claim + 计划任务            |
-| Trae      | [inlayin/trae-check](https://github.com/inlayin/trae-check)                 | Electron 桌面 GUI，多账号管理，参考了其设备 ID 去重策略 |
+| 产品      | 仓库                                                                            | 说明                                                    |
+| --------- | ------------------------------------------------------------------------------- | ------------------------------------------------------- |
+| WorkBuddy | [Maquer/workbuddy-checkin](https://github.com/Maquer/workbuddy-checkin)         | Python 标准库，端点最全最准，Docker/cron 部署           |
+| Trae      | [baokun-l/trae-work-checkin](https://github.com/baokun-l/trae-work-checkin)     | Python 标准库，OAuth 登录 + claim + 计划任务            |
+| Trae      | [inlayin/trae-check](https://github.com/inlayin/trae-check)                     | Electron 桌面 GUI，多账号管理，参考了其设备 ID 去重策略 |
 | Qoder     | [wzhu22750-lang/qoder_checkin](https://github.com/wzhu22750-lang/qoder_checkin) | PAT 换 job token + campaigns + claim，端点最简          |
-| Qoder     | [wallechfox/qoder-checkin](https://github.com/wallechfox/qoder-checkin)     | 客户端 DPAPI 解密 + Cosy 设备头 + 青龙部署（备选方案）   |
+| Qoder     | [wallechfox/qoder-checkin](https://github.com/wallechfox/qoder-checkin)         | 客户端 DPAPI 解密 + Cosy 设备头 + 青龙部署（备选方案）  |
 
 实测中根据真实接口返回修正了以下差异（与参考仓库不同）：
 
