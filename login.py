@@ -26,6 +26,7 @@
 import argparse
 import json
 import os
+import re
 import secrets
 import sys
 import time
@@ -44,9 +45,32 @@ CRED_DIR.mkdir(exist_ok=True)
 DEBUG = False
 
 
+_SENSITIVE_KV_RE = re.compile(
+    r'(["\'])([A-Za-z0-9_]*(?:[Tt]oken|[Ss]ecret)[A-Za-z0-9_]*)\1(\s*:\s*)(["\'])([^"\']{8,})\4'
+)
+_SENSITIVE_QS_RE = re.compile(
+    r'([?&][A-Za-z0-9_]*(?:[Tt]oken|[Ss]ecret)[A-Za-z0-9_]*=)([^&\s\'"]{8,})'
+)
+_BARE_TOKEN_RE = re.compile(
+    r'(?<![A-Za-z0-9_.-])(eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}'
+    r'|pt-[A-Za-z0-9_-]{8,}'
+    r'|[A-Za-z0-9_/+=-]{30,}\.[0-9a-f]{16})(?![A-Za-z0-9_.-])'
+)
+
+
+def _redact(text: str) -> str:
+    """日志脱敏：token/secret 类字段值与裸 token（JWT/PAT）只保留前 6 位。"""
+    text = _SENSITIVE_KV_RE.sub(
+        lambda m: f'{m.group(1)}{m.group(2)}{m.group(1)}{m.group(3)}{m.group(4)}{m.group(5)[:6]}***{m.group(4)}',
+        text,
+    )
+    text = _SENSITIVE_QS_RE.sub(lambda m: f"{m.group(1)}{m.group(2)[:6]}***", text)
+    return _BARE_TOKEN_RE.sub(lambda m: m.group(1)[:6] + "***", text)
+
+
 def dbg(msg: str) -> None:
     if DEBUG:
-        print(f"  [debug] {msg}", flush=True)
+        print(f"  [debug] {_redact(str(msg))}", flush=True)
 
 
 # ---------------------------------------------------------------------------
